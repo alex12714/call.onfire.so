@@ -1,0 +1,11 @@
+{
+  "applinks": {
+    "apps": [],
+    "details": [
+      {
+        "appID": "X72N6PAXCV.com.lanos.logic.onfiremobile",
+        "paths": ["/*"]
+      }
+    ]
+  }
+}
