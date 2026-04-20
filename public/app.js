@@ -298,6 +298,13 @@
       // Connect to the room
       await room.connect(joinData.server_url, joinData.token);
 
+      // Unblock remote audio playback while the join-click user-gesture chain is
+      // still fresh. Browsers otherwise suppress the hidden <audio> elements the
+      // LiveKit SDK auto-attaches — the AudioPlaybackStatusChanged handler below
+      // surfaces a tap-to-enable overlay if the browser still blocks it.
+      try { await room.startAudio(); } catch (_) { /* handled below */ }
+      if (!room.canPlaybackAudio) showEnableAudioPrompt(room);
+
       // Determine which tracks to publish
       const isVideo = joinData.call_type === 'video';
 
@@ -351,11 +358,31 @@
     });
 
     room.on(LivekitClient.RoomEvent.TrackSubscribed, (track, publication, participant) => {
+      // Explicitly attach remote audio tracks to a hidden <audio> element in the DOM.
+      // LiveKit auto-attaches by default, but keeping an explicit reference
+      // guarantees playback survives DOM re-renders from renderParticipants().
+      if (track.kind === LivekitClient.Track.Kind.Audio) {
+        const el = track.attach();
+        el.setAttribute('data-onfire-remote-audio', participant.identity || '');
+        el.style.display = 'none';
+        document.body.appendChild(el);
+      }
       renderParticipants();
     });
 
-    room.on(LivekitClient.RoomEvent.TrackUnsubscribed, () => {
+    room.on(LivekitClient.RoomEvent.TrackUnsubscribed, (track) => {
+      if (track && track.kind === LivekitClient.Track.Kind.Audio) {
+        track.detach().forEach((el) => el.remove());
+      }
       renderParticipants();
+    });
+
+    room.on(LivekitClient.RoomEvent.AudioPlaybackStatusChanged, () => {
+      if (room.canPlaybackAudio) {
+        hideEnableAudioPrompt();
+      } else {
+        showEnableAudioPrompt(room);
+      }
     });
 
     room.on(LivekitClient.RoomEvent.TrackMuted, () => {
@@ -483,6 +510,32 @@
     videoBtn.querySelector('.icon-video-off').classList.toggle('hidden', !state.isVideoOff);
   }
 
+  // ------------------------------------
+  // Audio Playback Unblock Prompt
+  // ------------------------------------
+  // Browsers block remote audio autoplay unless a user gesture is close in time.
+  // The gesture from the "Join Call" click is often lost across the async
+  // connect/token chain. Surface a tappable overlay that calls room.startAudio()
+  // on click to unblock.
+  function showEnableAudioPrompt(room) {
+    if (document.getElementById('enable-audio-prompt')) return;
+    const prompt = document.createElement('button');
+    prompt.id = 'enable-audio-prompt';
+    prompt.className = 'enable-audio-prompt';
+    prompt.type = 'button';
+    prompt.innerHTML = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg><span>Tap to enable audio</span>';
+    prompt.addEventListener('click', async () => {
+      try { await room.startAudio(); } catch (e) { console.warn('startAudio failed:', e); }
+      if (room.canPlaybackAudio) hideEnableAudioPrompt();
+    });
+    document.body.appendChild(prompt);
+  }
+
+  function hideEnableAudioPrompt() {
+    const prompt = document.getElementById('enable-audio-prompt');
+    if (prompt) prompt.remove();
+  }
+
   function setupCallControls() {
     $('btn-mic').addEventListener('click', async () => {
       if (!state.room) return;
@@ -537,6 +590,10 @@
       const elapsed = Math.floor((Date.now() - state.callStartTime) / 1000);
       durationText = `Duration: ${formatDuration(elapsed)}`;
     }
+
+    // Clean up audio playback UI and attached remote audio elements
+    hideEnableAudioPrompt();
+    document.querySelectorAll('audio[data-onfire-remote-audio]').forEach((el) => el.remove());
 
     // Disconnect room
     if (state.room) {
