@@ -2500,9 +2500,15 @@
       const data = await apiCall('get_poll_results', { p_poll_id: pollId });
       if (!data || data.error) return;
       const prev = pollState.polls.get(pollId) || {};
+      // Preserve a client-side closed_at stamp when get_poll_results returns
+      // a payload without the field populated (e.g. older backends or a race
+      // against the close_poll commit). The client stamp is the retention
+      // marker used by pollListActive() to keep the card through refetches.
+      const mergedClosedAt = data.closed_at || prev.closed_at || null;
       pollState.polls.set(pollId, {
         ...prev,
         ...data,
+        closed_at: mergedClosedAt,
         _selectedIndexes: prev._selectedIndexes || [],
         _voted: prev._voted || false,
       });
@@ -3006,7 +3012,25 @@
     } else if (msg.type === 'poll_vote_update') {
       if (msg.pollId) pollFetchResults(msg.pollId);
     } else if (msg.type === 'poll_closed') {
-      if (msg.pollId) pollFetchResults(msg.pollId);
+      if (!msg.pollId) return;
+      // Cache-through: stamp closed_at locally IMMEDIATELY so the poll is
+      // retained through the next pollListActive() refetch (which filters on
+      // `!card.closed_at`). Without this, there's a window where a refetch
+      // can race pollFetchResults() and drop the now-closed poll from the
+      // map — leaving a ghost in state or silently losing the entry if the
+      // drawer was closed.
+      //
+      // pollFetchResults() below then pulls authoritative final counts +
+      // server-side closed_at; the client stamp is just a retention marker.
+      const existing = pollState.polls.get(msg.pollId);
+      if (existing && !existing.closed_at) {
+        pollState.polls.set(msg.pollId, {
+          ...existing,
+          closed_at: new Date().toISOString(),
+        });
+        if (pollState.panelOpen) pollRenderList();
+      }
+      pollFetchResults(msg.pollId);
     }
   }
 
