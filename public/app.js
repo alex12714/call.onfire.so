@@ -10,6 +10,7 @@
   // ------------------------------------
   const API_BASE = 'https://api2.onfire.so';
   const DEEP_LINK_BASE = 'https://call.onfire.so';
+  const POLL_INTERVAL = 3000; // 3 seconds
 
   // ------------------------------------
   // State
@@ -28,6 +29,11 @@
     previewStream: null,
     isPreviewCameraOff: false,
     isPreviewMicOff: false,
+    isScreenSharing: false,
+    remoteScreenShareTrack: null,
+    remoteScreenShareParticipant: null,
+    pollTimer: null,       // Polling timer for start-meeting flow
+    hasSeenInitialRoster: false, // true ~2s after Connected; suppresses join chime for pre-existing participants
   };
 
   // ------------------------------------
@@ -39,6 +45,8 @@
     landing: $('screen-landing'),
     loading: $('screen-loading'),
     error: $('screen-error'),
+    startMeeting: $('screen-start-meeting'),
+    meetingReady: $('screen-meeting-ready'),
     join: $('screen-join'),
     call: $('screen-call'),
     ended: $('screen-ended'),
@@ -119,6 +127,123 @@
   }
 
   // ------------------------------------
+  // Start Meeting Screen (link doesn't exist)
+  // ------------------------------------
+  function showStartMeetingScreen(slug) {
+    // Display the slug
+    $('display-slug').textContent = slug;
+
+    // Generate QR code pointing to the deep link with action=create
+    const qrUrl = DEEP_LINK_BASE + '/' + slug + '?action=create';
+
+    try {
+      new QRious({
+        element: $('qr-code-canvas'),
+        value: qrUrl,
+        size: 290,
+        level: 'M',
+        background: '#ffffff',
+        foreground: '#1a1f26',
+        padding: 0,
+      });
+    } catch (e) {
+      console.error('QR code generation failed:', e);
+    }
+
+    showScreen('startMeeting');
+
+    // Start polling for the link to be created
+    startPolling(slug);
+  }
+
+  // ------------------------------------
+  // Polling Logic
+  // ------------------------------------
+  function startPolling(slug) {
+    stopPolling();
+
+    state.pollTimer = setInterval(async () => {
+      try {
+        const data = await getCallLink(slug);
+
+        if (!data.error) {
+          // Link was created — stop polling and show meeting ready screen
+          stopPolling();
+          state.callLink = data;
+          showMeetingReadyScreen(slug, data);
+        }
+      } catch (err) {
+        // Ignore poll errors — just keep trying
+        console.debug('Poll check:', err.message);
+      }
+    }, POLL_INTERVAL);
+  }
+
+  function stopPolling() {
+    if (state.pollTimer) {
+      clearInterval(state.pollTimer);
+      state.pollTimer = null;
+    }
+  }
+
+  // ------------------------------------
+  // Meeting Ready Screen
+  // ------------------------------------
+  function showMeetingReadyScreen(slug, data) {
+    const meetingUrl = DEEP_LINK_BASE + '/' + slug;
+
+    // Set the link input
+    $('ready-meeting-link').value = meetingUrl;
+
+    // Creator info
+    const name = (data.creator_name || '').trim();
+    if (name) {
+      $('ready-creator-initials').textContent = getInitials(name);
+      $('ready-creator-text').textContent = 'Created by ' + name;
+      $('creator-ready-info').style.display = '';
+    } else {
+      $('creator-ready-info').style.display = 'none';
+    }
+
+    // Copy button
+    $('btn-copy-link').addEventListener('click', function () {
+      navigator.clipboard.writeText(meetingUrl).then(function () {
+        $('copy-label').textContent = 'Copied!';
+        setTimeout(function () { $('copy-label').textContent = 'Copy'; }, 2000);
+      }).catch(function () {
+        // Fallback: select the input
+        $('ready-meeting-link').select();
+        document.execCommand('copy');
+        $('copy-label').textContent = 'Copied!';
+        setTimeout(function () { $('copy-label').textContent = 'Copy'; }, 2000);
+      });
+    });
+
+    // Share button (Web Share API)
+    $('btn-share-link').addEventListener('click', function () {
+      if (navigator.share) {
+        navigator.share({
+          title: 'Join my OnFire meeting',
+          text: 'Join my meeting on OnFire',
+          url: meetingUrl,
+        }).catch(function () { /* user cancelled */ });
+      } else {
+        // Fallback: copy to clipboard
+        navigator.clipboard.writeText(meetingUrl);
+        $('copy-label').textContent = 'Copied!';
+        setTimeout(function () { $('copy-label').textContent = 'Copy'; }, 2000);
+      }
+    });
+
+    // Join button → go to normal join flow
+    $('btn-join-ready').addEventListener('click', function () {
+      renderJoinScreen(data);
+    });
+
+    showScreen('meetingReady');
+  }
+
+  // ------------------------------------
   // Join Screen Logic
   // ------------------------------------
   function renderJoinScreen(data) {
@@ -156,7 +281,7 @@
     // Mobile app prompt
     if (isMobile()) {
       $('mobile-app-prompt').classList.remove('hidden');
-      $('btn-open-app').href = `${DEEP_LINK_BASE}/${state.token}`;
+      $('btn-open-app').href = DEEP_LINK_BASE + '/' + state.token;
     }
 
     // Input & button logic
@@ -213,7 +338,6 @@
       $('video-preview-container').classList.add('hidden');
     }
 
-    // Remove old listeners before adding to prevent accumulation on rejoin
     $('btn-toggle-camera-preview').removeEventListener('click', _onToggleCameraPreview);
     $('btn-toggle-mic-preview').removeEventListener('click', _onToggleMicPreview);
     $('btn-toggle-camera-preview').addEventListener('click', _onToggleCameraPreview);
@@ -238,7 +362,6 @@
     const btnText = joinBtn.querySelector('.btn-text');
     const btnSpinner = joinBtn.querySelector('.btn-spinner');
 
-    // Show loading state
     joinBtn.disabled = true;
     btnText.textContent = 'Joining...';
     btnSpinner.classList.remove('hidden');
@@ -252,6 +375,7 @@
       }
 
       state.joinData = data;
+
       stopVideoPreview();
       await startCall(data);
     } catch (err) {
@@ -269,7 +393,6 @@
   async function startCall(joinData) {
     showScreen('call');
 
-    // Add connecting overlay
     const callContainer = document.querySelector('.call-container');
     const overlay = document.createElement('div');
     overlay.className = 'connecting-overlay';
@@ -291,11 +414,9 @@
       });
 
       state.room = room;
-
-      // Set up event handlers before connecting
+      state.hasSeenInitialRoster = false;
       setupRoomEvents(room);
 
-      // Connect to the room
       await room.connect(joinData.server_url, joinData.token);
 
       // Unblock remote audio playback while the join-click user-gesture chain is
@@ -305,10 +426,8 @@
       try { await room.startAudio(); } catch (_) { /* handled below */ }
       if (!room.canPlaybackAudio) showEnableAudioPrompt(room);
 
-      // Determine which tracks to publish
       const isVideo = joinData.call_type === 'video';
 
-      // Publish local tracks
       await room.localParticipant.setMicrophoneEnabled(!state.isPreviewMicOff);
       if (isVideo) {
         await room.localParticipant.setCameraEnabled(!state.isPreviewCameraOff);
@@ -317,26 +436,24 @@
       state.isMicMuted = state.isPreviewMicOff;
       state.isVideoOff = isVideo ? state.isPreviewCameraOff : true;
 
-      // Update button states
       updateControlButtons();
 
-      // Hide video button for audio-only calls
       if (!isVideo) {
         $('btn-video').style.display = 'none';
       }
 
-      // Remove connecting overlay
+      if (isMobile()) {
+        $('btn-screen-share').style.display = 'none';
+      }
+
       overlay.remove();
 
-      // Update status
       $('call-status').textContent = 'Connected';
       $('call-status').classList.add('connected');
 
-      // Start timer
       state.callStartTime = Date.now();
       state.timerInterval = setInterval(updateCallTimer, 1000);
 
-      // Render initial participants
       renderParticipants();
 
     } catch (err) {
@@ -349,18 +466,42 @@
   function setupRoomEvents(room) {
     const LivekitClient = window.LivekitClient;
 
-    room.on(LivekitClient.RoomEvent.ParticipantConnected, () => {
+    room.on(LivekitClient.RoomEvent.Connected, () => {
+      // Participants already in the room at connect time fire ParticipantConnected
+      // during the initial roster. Suppress chimes for those and only start playing
+      // them ~2s after Connected.
+      setTimeout(() => { state.hasSeenInitialRoster = true; }, 2000);
+    });
+
+    room.on(LivekitClient.RoomEvent.ParticipantConnected, (participant) => {
+      if (
+        state.hasSeenInitialRoster &&
+        room.localParticipant &&
+        participant.identity !== room.localParticipant.identity
+      ) {
+        playChime('/sounds/join.ogg');
+      }
       renderParticipants();
     });
 
-    room.on(LivekitClient.RoomEvent.ParticipantDisconnected, () => {
+    room.on(LivekitClient.RoomEvent.ParticipantDisconnected, (participant) => {
+      if (
+        state.hasSeenInitialRoster &&
+        room.localParticipant &&
+        participant.identity !== room.localParticipant.identity
+      ) {
+        playChime('/sounds/leave.ogg');
+      }
       renderParticipants();
     });
 
     room.on(LivekitClient.RoomEvent.TrackSubscribed, (track, publication, participant) => {
+      if (track.source === LivekitClient.Track.Source.ScreenShare) {
+        showScreenShareView(track, participant);
+      }
       // Explicitly attach remote audio tracks to a hidden <audio> element in the DOM.
-      // LiveKit auto-attaches by default, but keeping an explicit reference
-      // guarantees playback survives DOM re-renders from renderParticipants().
+      // LiveKit auto-attaches by default, but keeping an explicit reference guarantees
+      // playback survives DOM re-renders from renderParticipants().
       if (track.kind === LivekitClient.Track.Kind.Audio) {
         const el = track.attach();
         el.setAttribute('data-onfire-remote-audio', participant.identity || '');
@@ -371,6 +512,9 @@
     });
 
     room.on(LivekitClient.RoomEvent.TrackUnsubscribed, (track) => {
+      if (track.source === LivekitClient.Track.Source.ScreenShare) {
+        hideScreenShareView();
+      }
       if (track && track.kind === LivekitClient.Track.Kind.Audio) {
         track.detach().forEach((el) => el.remove());
       }
@@ -385,19 +529,22 @@
       }
     });
 
-    room.on(LivekitClient.RoomEvent.TrackMuted, () => {
+    room.on(LivekitClient.RoomEvent.TrackMuted, () => renderParticipants());
+    room.on(LivekitClient.RoomEvent.TrackUnmuted, () => renderParticipants());
+
+    room.on(LivekitClient.RoomEvent.LocalTrackPublished, (publication) => {
+      if (publication.source === LivekitClient.Track.Source.ScreenShare && publication.track) {
+        showScreenShareView(publication.track, room.localParticipant);
+      }
       renderParticipants();
     });
 
-    room.on(LivekitClient.RoomEvent.TrackUnmuted, () => {
-      renderParticipants();
-    });
-
-    room.on(LivekitClient.RoomEvent.LocalTrackPublished, () => {
-      renderParticipants();
-    });
-
-    room.on(LivekitClient.RoomEvent.LocalTrackUnpublished, () => {
+    room.on(LivekitClient.RoomEvent.LocalTrackUnpublished, (publication) => {
+      if (publication.source === LivekitClient.Track.Source.ScreenShare) {
+        hideScreenShareView();
+        state.isScreenSharing = false;
+        updateScreenShareButton();
+      }
       renderParticipants();
     });
 
@@ -414,6 +561,19 @@
     room.on(LivekitClient.RoomEvent.Reconnected, () => {
       $('call-status').textContent = 'Connected';
       $('call-status').classList.add('connected');
+    });
+
+    // Data channel messages for chat
+    room.on(LivekitClient.RoomEvent.DataReceived, (payload, participant) => {
+      try {
+        const text = new TextDecoder().decode(payload);
+        const msg = JSON.parse(text);
+        if (msg.type === 'chat_message' || msg.type === 'chat_file') {
+          chatAddIncoming(msg, participant);
+        }
+      } catch (e) {
+        // Ignore non-chat data
+      }
     });
   }
 
@@ -442,7 +602,6 @@
     const tile = document.createElement('div');
     tile.className = 'participant-tile' + (isLocal ? ' local' : '');
 
-    // Check for video track
     let videoTrack = null;
     participant.videoTrackPublications.forEach((pub) => {
       if (pub.track && pub.source === 'camera' && !pub.isMuted) {
@@ -457,18 +616,15 @@
       videoEl.style.objectFit = 'cover';
       tile.appendChild(videoEl);
     } else {
-      // Show avatar placeholder
       const avatar = document.createElement('div');
       avatar.className = 'avatar-placeholder';
       avatar.textContent = getInitials(participant.name || participant.identity);
       tile.appendChild(avatar);
     }
 
-    // Name label
     const nameEl = document.createElement('div');
     nameEl.className = 'participant-name';
 
-    // Mic indicator
     let isMicMuted = true;
     participant.audioTrackPublications.forEach((pub) => {
       if (pub.source === 'microphone' && pub.track && !pub.isMuted) {
@@ -499,15 +655,76 @@
     const micBtn = $('btn-mic');
     const videoBtn = $('btn-video');
 
-    // Mic button
     micBtn.classList.toggle('muted', state.isMicMuted);
     micBtn.querySelector('.icon-mic-on').classList.toggle('hidden', state.isMicMuted);
     micBtn.querySelector('.icon-mic-off').classList.toggle('hidden', !state.isMicMuted);
 
-    // Video button
     videoBtn.classList.toggle('muted', state.isVideoOff);
     videoBtn.querySelector('.icon-video-on').classList.toggle('hidden', state.isVideoOff);
     videoBtn.querySelector('.icon-video-off').classList.toggle('hidden', !state.isVideoOff);
+  }
+
+  function updateScreenShareButton() {
+    const btn = $('btn-screen-share');
+    if (!btn) return;
+    btn.classList.toggle('active', state.isScreenSharing);
+    btn.querySelector('.icon-screen-share-off').classList.toggle('hidden', state.isScreenSharing);
+    btn.querySelector('.icon-screen-share-on').classList.toggle('hidden', !state.isScreenSharing);
+  }
+
+  async function toggleScreenShare() {
+    if (!state.room) return;
+    try {
+      state.isScreenSharing = !state.isScreenSharing;
+      await state.room.localParticipant.setScreenShareEnabled(state.isScreenSharing);
+      updateScreenShareButton();
+    } catch (e) {
+      console.error('Screen share failed:', e);
+      state.isScreenSharing = false;
+      updateScreenShareButton();
+    }
+  }
+
+  function showScreenShareView(track, participant) {
+    state.remoteScreenShareTrack = track;
+    state.remoteScreenShareParticipant = participant;
+
+    let container = $('screen-share-container');
+    if (!container) {
+      container = document.createElement('div');
+      container.id = 'screen-share-container';
+      container.className = 'screen-share-container';
+      const grid = $('participants-grid');
+      grid.parentNode.insertBefore(container, grid);
+    }
+
+    container.innerHTML = '';
+    const videoEl = track.attach();
+    videoEl.style.width = '100%';
+    videoEl.style.height = '100%';
+    videoEl.style.objectFit = 'contain';
+    container.appendChild(videoEl);
+
+    const label = document.createElement('div');
+    label.className = 'screen-share-label';
+    label.textContent = (participant.name || participant.identity || 'Someone') + "'s screen";
+    container.appendChild(label);
+
+    container.classList.add('active');
+    $('participants-grid').classList.add('strip-mode');
+  }
+
+  function hideScreenShareView() {
+    state.remoteScreenShareTrack = null;
+    state.remoteScreenShareParticipant = null;
+
+    const container = $('screen-share-container');
+    if (container) {
+      container.classList.remove('active');
+      container.innerHTML = '';
+    }
+
+    $('participants-grid').classList.remove('strip-mode');
   }
 
   // ------------------------------------
@@ -536,6 +753,20 @@
     if (prompt) prompt.remove();
   }
 
+  // ------------------------------------
+  // Join / Leave Chimes
+  // ------------------------------------
+  function playChime(src) {
+    try {
+      const a = new Audio(src);
+      a.volume = 0.4;
+      // autoplay may be blocked; swallow the rejection silently — chimes are non-critical
+      a.play().catch(() => {});
+    } catch (_) {
+      // Ignore Audio constructor failures on exotic browsers
+    }
+  }
+
   function setupCallControls() {
     $('btn-mic').addEventListener('click', async () => {
       if (!state.room) return;
@@ -553,11 +784,28 @@
       renderParticipants();
     });
 
+    $('btn-screen-share').addEventListener('click', () => toggleScreenShare());
+
+    $('btn-chat').addEventListener('click', () => chatTogglePanel());
+
     $('btn-hangup').addEventListener('click', () => {
-      if (state.room) {
-        state.room.disconnect();
-      }
+      if (state.room) state.room.disconnect();
       endCall();
+    });
+
+    // Chat controls
+    $('btn-close-chat').addEventListener('click', () => chatTogglePanel());
+    $('btn-send-chat').addEventListener('click', () => chatSendMessage());
+    $('chat-input').addEventListener('input', () => {
+      $('btn-send-chat').disabled = !$('chat-input').value.trim();
+    });
+    $('chat-input').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && $('chat-input').value.trim()) chatSendMessage();
+    });
+    $('chat-file-input').addEventListener('change', (e) => {
+      const file = e.target.files[0];
+      if (file) chatSendFile(file);
+      e.target.value = '';
     });
   }
 
@@ -578,50 +826,46 @@
     if (_endingCall) return;
     _endingCall = true;
 
-    // Stop timer
     if (state.timerInterval) {
       clearInterval(state.timerInterval);
       state.timerInterval = null;
     }
 
-    // Calculate duration
     let durationText = '';
     if (state.callStartTime) {
       const elapsed = Math.floor((Date.now() - state.callStartTime) / 1000);
-      durationText = `Duration: ${formatDuration(elapsed)}`;
+      durationText = 'Duration: ' + formatDuration(elapsed);
     }
+
+    state.isScreenSharing = false;
+    state.remoteScreenShareTrack = null;
+    state.remoteScreenShareParticipant = null;
+    state.hasSeenInitialRoster = false;
+    updateScreenShareButton();
+    hideScreenShareView();
 
     // Clean up audio playback UI and attached remote audio elements
     hideEnableAudioPrompt();
     document.querySelectorAll('audio[data-onfire-remote-audio]').forEach((el) => el.remove());
 
-    // Disconnect room
     if (state.room) {
-      try {
-        state.room.disconnect();
-      } catch (e) {
-        // ignore
-      }
+      try { state.room.disconnect(); } catch (e) {}
       state.room = null;
     }
 
-    // Show ended screen
     $('ended-duration').textContent = durationText;
     showScreen('ended');
 
-    // Rejoin button
     $('btn-rejoin').onclick = () => {
       _endingCall = false;
       state.callStartTime = null;
       state.isMicMuted = false;
       state.isVideoOff = false;
       showScreen('join');
-      // Re-enable join button
       const joinBtn = $('btn-join');
       joinBtn.disabled = !$('guest-name').value.trim();
       joinBtn.querySelector('.btn-text').textContent = 'Join Call';
       joinBtn.querySelector('.btn-spinner').classList.add('hidden');
-      // Restart video preview if it was a video call
       if (state.callLink && state.callLink.call_type === 'video') {
         startVideoPreview();
       }
@@ -629,28 +873,258 @@
   }
 
   // ------------------------------------
+  // Join by Code (Landing Page)
+  // ------------------------------------
+  function setupJoinCodeForm() {
+    const input = $('join-code-input');
+    const btn = $('btn-join-code');
+    const errorEl = $('join-code-error');
+
+    function extractCode(value) {
+      let code = value.trim();
+      code = code.replace(/^https?:\/\/call\.onfire\.so\/?/i, '');
+      code = code.replace(/^\/+|\/+$/g, '');
+      code = code.toLowerCase();
+      return code;
+    }
+
+    function updateButton() {
+      const code = extractCode(input.value);
+      btn.disabled = code.length < 3;
+      errorEl.classList.add('hidden');
+    }
+
+    function navigateToCode() {
+      const code = extractCode(input.value);
+      if (code.length < 3) return;
+
+      if (!/^[a-z0-9][a-z0-9\-]*[a-z0-9]$/.test(code) && !/^[a-z0-9]{1,2}$/.test(code)) {
+        errorEl.textContent = 'Enter a valid meeting code (letters, numbers, hyphens)';
+        errorEl.classList.remove('hidden');
+        return;
+      }
+
+      window.location.href = '/' + code;
+    }
+
+    input.addEventListener('input', updateButton);
+    input.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') navigateToCode();
+    });
+    btn.addEventListener('click', navigateToCode);
+  }
+
+  // ------------------------------------
+  // Slug Validation
+  // ------------------------------------
+  function isValidSlug(slug) {
+    // Must be 3-30 chars, lowercase letters, numbers, hyphens
+    return /^[a-z0-9][a-z0-9\-]{1,28}[a-z0-9]$/.test(slug) || /^[a-z0-9]{1,2}$/.test(slug);
+  }
+
+  // ------------------------------------
+  // Chat Module (via LiveKit Data Channels)
+  // ------------------------------------
+  const chatMessages = [];
+  let chatUnreadCount = 0;
+  let chatPanelOpen = false;
+
+  function chatTogglePanel() {
+    chatPanelOpen = !chatPanelOpen;
+    const panel = $('chat-panel');
+    panel.classList.toggle('hidden', !chatPanelOpen);
+    $('btn-chat').classList.toggle('active', chatPanelOpen);
+
+    if (chatPanelOpen) {
+      chatUnreadCount = 0;
+      $('chat-badge').classList.add('hidden');
+      chatScrollToBottom();
+      $('chat-input').focus();
+    }
+  }
+
+  function chatSendMessage() {
+    const input = $('chat-input');
+    const text = input.value.trim();
+    if (!text || !state.room) return;
+
+    const msg = {
+      type: 'chat_message',
+      id: crypto.randomUUID(),
+      sender: state.room.localParticipant.identity,
+      senderName: state.room.localParticipant.name || 'You',
+      text: text,
+      timestamp: Date.now(),
+    };
+
+    // Send via LiveKit data channel
+    const data = new TextEncoder().encode(JSON.stringify(msg));
+    state.room.localParticipant.publishData(data, { reliable: true });
+
+    // Add to local messages
+    chatMessages.push({ ...msg, isSelf: true });
+    chatRenderMessages();
+    chatScrollToBottom();
+
+    input.value = '';
+    $('btn-send-chat').disabled = true;
+  }
+
+  function chatSendFile(file) {
+    if (!state.room || !file) return;
+
+    // Limit file size to 2MB for data channel
+    if (file.size > 2 * 1024 * 1024) {
+      alert('File must be under 2MB');
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = function () {
+      const base64 = reader.result.split(',')[1];
+      const msg = {
+        type: 'chat_file',
+        id: crypto.randomUUID(),
+        sender: state.room.localParticipant.identity,
+        senderName: state.room.localParticipant.name || 'You',
+        fileName: file.name,
+        fileSize: file.size,
+        mimeType: file.type,
+        fileData: base64,
+        timestamp: Date.now(),
+      };
+
+      const data = new TextEncoder().encode(JSON.stringify(msg));
+      state.room.localParticipant.publishData(data, { reliable: true });
+
+      chatMessages.push({ ...msg, isSelf: true });
+      chatRenderMessages();
+      chatScrollToBottom();
+    };
+    reader.readAsDataURL(file);
+  }
+
+  function chatAddIncoming(msg, participant) {
+    // Ignore own messages (echoed back)
+    if (state.room && msg.sender === state.room.localParticipant.identity) return;
+
+    chatMessages.push({ ...msg, isSelf: false });
+    chatRenderMessages();
+
+    if (chatPanelOpen) {
+      chatScrollToBottom();
+    } else {
+      chatUnreadCount++;
+      const badge = $('chat-badge');
+      badge.textContent = String(chatUnreadCount);
+      badge.classList.remove('hidden');
+    }
+  }
+
+  function chatRenderMessages() {
+    const container = $('chat-messages');
+    container.innerHTML = '';
+
+    for (const msg of chatMessages) {
+      const wrapper = document.createElement('div');
+      wrapper.className = 'chat-msg' + (msg.isSelf ? ' self' : '');
+
+      if (!msg.isSelf) {
+        const sender = document.createElement('div');
+        sender.className = 'chat-msg-sender';
+        sender.textContent = msg.senderName || msg.sender;
+        wrapper.appendChild(sender);
+      }
+
+      if (msg.type === 'chat_file') {
+        const fileEl = document.createElement('a');
+        fileEl.className = 'chat-msg-file';
+
+        // Create download blob from base64
+        if (msg.fileData) {
+          try {
+            const byteChars = atob(msg.fileData);
+            const byteNums = new Array(byteChars.length);
+            for (let i = 0; i < byteChars.length; i++) byteNums[i] = byteChars.charCodeAt(i);
+            const blob = new Blob([new Uint8Array(byteNums)], { type: msg.mimeType || 'application/octet-stream' });
+            fileEl.href = URL.createObjectURL(blob);
+            fileEl.download = msg.fileName;
+          } catch (e) {
+            fileEl.href = '#';
+          }
+        }
+
+        fileEl.innerHTML = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>'
+          + '<div class="chat-msg-file-info">'
+          + '<div class="chat-msg-file-name">' + escapeHtml(msg.fileName) + '</div>'
+          + '<div class="chat-msg-file-size">' + formatFileSize(msg.fileSize) + '</div>'
+          + '</div>';
+
+        wrapper.appendChild(fileEl);
+      } else {
+        const bubble = document.createElement('div');
+        bubble.className = 'chat-msg-bubble';
+        bubble.textContent = msg.text;
+        wrapper.appendChild(bubble);
+      }
+
+      const time = document.createElement('div');
+      time.className = 'chat-msg-time';
+      time.textContent = new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      wrapper.appendChild(time);
+
+      container.appendChild(wrapper);
+    }
+  }
+
+  function chatScrollToBottom() {
+    const container = $('chat-messages');
+    requestAnimationFrame(() => {
+      container.scrollTop = container.scrollHeight;
+    });
+  }
+
+  function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+  }
+
+  function formatFileSize(bytes) {
+    if (!bytes) return '';
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+    return (bytes / 1048576).toFixed(1) + ' MB';
+  }
+
+  // ------------------------------------
   // Initialization
   // ------------------------------------
   async function init() {
-    // Extract token from URL path
     const path = window.location.pathname.replace(/^\/+|\/+$/g, '');
 
     if (!path) {
-      // Root page — show the landing page
       showScreen('landing');
+      setupJoinCodeForm();
       return;
     }
 
     state.token = path;
-
-    // Set up call controls early
     setupCallControls();
+
+    // Show loading while we check if the link exists
+    showScreen('loading');
 
     try {
       const data = await getCallLink(state.token);
 
       if (data.error) {
-        showError('Link Not Found', data.error);
+        // Link doesn't exist — check if the slug looks valid for creating a new meeting
+        if (isValidSlug(state.token)) {
+          showStartMeetingScreen(state.token);
+        } else {
+          showError('Link Not Found', data.error);
+        }
         return;
       }
 
