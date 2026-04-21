@@ -400,6 +400,14 @@
             </svg>
             <span id="chat-badge" class="chat-badge hidden">0</span>
           </button>
+          <button id="btn-polls" class="control-btn" title="Polls">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="18" y1="20" x2="18" y2="10"/>
+              <line x1="12" y1="20" x2="12" y2="4"/>
+              <line x1="6" y1="20" x2="6" y2="14"/>
+            </svg>
+            <span id="poll-badge" class="chat-badge hidden">0</span>
+          </button>
           <button id="btn-screen-share" class="control-btn control-btn-screen-share" title="Share Screen">
             <svg class="icon-screen-share-off" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>
@@ -416,6 +424,55 @@
           </button>
         </div>
       </div>
+      <!-- Poll sidebar -->
+      <div id="poll-panel" class="poll-panel hidden">
+        <div class="poll-panel-header">
+          <h3>Polls</h3>
+          <button id="btn-close-polls" class="chat-close-btn" title="Close polls">&times;</button>
+        </div>
+        <div id="poll-list" class="poll-list">
+          <p class="poll-empty">No polls yet. Create the first one!</p>
+        </div>
+        <div class="poll-panel-footer">
+          <button id="btn-open-create-poll" class="btn btn-primary btn-create-poll">+ Create Poll</button>
+        </div>
+      </div>
+
+      <!-- Create Poll Modal -->
+      <div id="poll-create-modal" class="poll-create-modal hidden">
+        <div class="poll-create-backdrop"></div>
+        <div class="poll-create-sheet">
+          <div class="poll-create-header">
+            <h3>Create Poll</h3>
+            <button id="btn-close-create-poll" class="chat-close-btn" title="Cancel">&times;</button>
+          </div>
+          <div class="poll-create-body">
+            <label class="poll-field-label" for="poll-question-input">Question</label>
+            <input type="text" id="poll-question-input" class="poll-input" placeholder="What do you want to ask?" maxlength="500" autocomplete="off">
+
+            <div class="poll-type-group">
+              <label class="poll-type-option">
+                <input type="radio" name="poll-type" value="single" checked>
+                <span>Single choice</span>
+              </label>
+              <label class="poll-type-option">
+                <input type="radio" name="poll-type" value="multiple">
+                <span>Multiple choice</span>
+              </label>
+            </div>
+
+            <label class="poll-field-label">Options</label>
+            <div id="poll-options-list" class="poll-options-list"></div>
+            <button id="btn-add-option" class="btn-add-option" type="button">+ Add option</button>
+            <p id="poll-create-error" class="poll-create-error hidden"></p>
+          </div>
+          <div class="poll-create-footer">
+            <button id="btn-cancel-create-poll" class="btn btn-secondary">Cancel</button>
+            <button id="btn-submit-create-poll" class="btn btn-primary" disabled>Create</button>
+          </div>
+        </div>
+      </div>
+
       <!-- Chat sidebar -->
       <div id="chat-panel" class="chat-panel hidden">
         <div class="chat-panel-header">

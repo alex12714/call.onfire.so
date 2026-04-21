@@ -461,6 +461,9 @@
 
       renderParticipants();
 
+      // Late-joiner catchup: pull any active polls for this room.
+      pollListActive().catch((e) => console.warn('pollListActive failed on join:', e));
+
     } catch (err) {
       console.error('Call start error:', err);
       overlay.remove();
@@ -581,6 +584,8 @@
           if (state.isHandRaised) {
             lowerLocalHand().catch((e) => console.warn('lowerLocalHand failed:', e));
           }
+        } else if (msg.type === 'poll_new' || msg.type === 'poll_vote_update' || msg.type === 'poll_closed') {
+          pollHandleDataPacket(msg);
         }
       } catch (e) {
         // Ignore non-chat data
@@ -969,6 +974,9 @@
       if (file) chatSendFile(file);
       e.target.value = '';
     });
+
+    // Polls
+    setupPollControls();
   }
 
   // ------------------------------------
@@ -1011,6 +1019,17 @@
     // Clean up audio playback UI and attached remote audio elements
     hideEnableAudioPrompt();
     document.querySelectorAll('audio[data-onfire-remote-audio]').forEach((el) => el.remove());
+
+    // Clear poll state and close poll UI
+    pollState.polls.clear();
+    pollState.inflight.clear();
+    pollState.panelOpen = false;
+    const pollPanelEl = document.getElementById('poll-panel');
+    if (pollPanelEl) pollPanelEl.classList.add('hidden');
+    const pollBadge = document.getElementById('poll-badge');
+    if (pollBadge) { pollBadge.textContent = '0'; pollBadge.classList.add('hidden'); }
+    const createModal = document.getElementById('poll-create-modal');
+    if (createModal) createModal.classList.add('hidden');
 
     if (state.room) {
       try { state.room.disconnect(); } catch (e) {}
@@ -1259,6 +1278,637 @@
     if (bytes < 1024) return bytes + ' B';
     if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
     return (bytes / 1048576).toFixed(1) + ' MB';
+  }
+
+  // ------------------------------------
+  // Polls Module (via PostgREST RPCs + LiveKit Data Channels)
+  // ------------------------------------
+  // In-memory cache of polls shown in the panel.
+  //   key = poll.id (uuid)
+  //   value = {
+  //     id, question, options, poll_type, creator_identity, created_at,
+  //     closed_at?, total_voters?, option_counts?,
+  //     _selectedIndexes: [int],   // UI state for radio/checkbox before voting
+  //     _voted: bool,              // true once we've voted (so button says "Update vote")
+  //     _error?: string,           // inline error from last action on this card
+  //   }
+  const pollState = {
+    polls: new Map(),
+    panelOpen: false,
+    inflight: new Set(), // ids currently being voted/closed to prevent double-fire
+  };
+
+  function pollPanelOpen() {
+    pollState.panelOpen = true;
+    $('poll-panel').classList.remove('hidden');
+    $('btn-polls').classList.add('active');
+    $('poll-badge').classList.add('hidden');
+    pollRenderList();
+  }
+
+  function pollPanelClose() {
+    pollState.panelOpen = false;
+    $('poll-panel').classList.add('hidden');
+    $('btn-polls').classList.remove('active');
+  }
+
+  function pollPanelToggle() {
+    if (pollState.panelOpen) pollPanelClose();
+    else pollPanelOpen();
+  }
+
+  function pollLocalIdentity() {
+    return (state.room && state.room.localParticipant && state.room.localParticipant.identity) || null;
+  }
+
+  function pollRoomName() {
+    // joinData is the payload from join_call_as_guest. Different backend
+    // versions have exposed the LiveKit room name under slightly different
+    // keys, so fall back through the likely candidates before giving up.
+    const jd = state.joinData || {};
+    if (jd.room_name) return jd.room_name;
+    if (jd.roomName) return jd.roomName;
+    if (jd.room && typeof jd.room === 'string') return jd.room;
+    if (jd.room && jd.room.name) return jd.room.name;
+    // Final fallback: the live LiveKit Room object exposes the name.
+    if (state.room && state.room.name) return state.room.name;
+    return null;
+  }
+
+  async function pollPublishDataPacket(payload) {
+    try {
+      if (!state.room || !state.room.localParticipant) return;
+      const buf = new TextEncoder().encode(JSON.stringify(payload));
+      await state.room.localParticipant.publishData(buf, { reliable: true });
+    } catch (e) {
+      console.warn('poll publishData failed:', e);
+    }
+  }
+
+  async function pollListActive() {
+    const roomName = pollRoomName();
+    if (!roomName) return;
+    try {
+      const data = await apiCall('list_active_polls', { p_room_name: roomName });
+      if (!Array.isArray(data)) return;
+      // Merge into local cache, preserving per-card UI state where possible.
+      const seenIds = new Set();
+      for (const p of data) {
+        seenIds.add(p.id);
+        const prev = pollState.polls.get(p.id) || {};
+        pollState.polls.set(p.id, {
+          ...prev,
+          ...p,
+          _selectedIndexes: prev._selectedIndexes || [],
+          _voted: prev._voted || false,
+        });
+      }
+      // Drop cached polls that are no longer active AND aren't closed (they may have been deleted).
+      // Note: closed polls aren't returned by list_active_polls, so we keep them explicitly.
+      for (const [id, card] of pollState.polls) {
+        if (!seenIds.has(id) && !card.closed_at) pollState.polls.delete(id);
+      }
+      pollRenderList();
+    } catch (e) {
+      console.warn('list_active_polls failed:', e);
+    }
+  }
+
+  async function pollFetchResults(pollId) {
+    try {
+      const data = await apiCall('get_poll_results', { p_poll_id: pollId });
+      if (!data || data.error) return;
+      const prev = pollState.polls.get(pollId) || {};
+      pollState.polls.set(pollId, {
+        ...prev,
+        ...data,
+        _selectedIndexes: prev._selectedIndexes || [],
+        _voted: prev._voted || false,
+      });
+      if (pollState.panelOpen) pollRenderList();
+      else pollBumpBadge();
+    } catch (e) {
+      console.warn('get_poll_results failed:', e);
+    }
+  }
+
+  function pollBumpBadge() {
+    const badge = $('poll-badge');
+    if (!badge) return;
+    const current = parseInt(badge.textContent || '0', 10) || 0;
+    badge.textContent = String(current + 1);
+    badge.classList.remove('hidden');
+  }
+
+  // Sorted list: active polls first (newest created first), then closed polls.
+  function pollSortedList() {
+    const all = Array.from(pollState.polls.values());
+    all.sort((a, b) => {
+      const aClosed = !!a.closed_at;
+      const bClosed = !!b.closed_at;
+      if (aClosed !== bClosed) return aClosed ? 1 : -1;
+      const aT = new Date(a.created_at || 0).getTime();
+      const bT = new Date(b.created_at || 0).getTime();
+      return bT - aT;
+    });
+    return all;
+  }
+
+  function pollRenderList() {
+    const listEl = $('poll-list');
+    if (!listEl) return;
+    const polls = pollSortedList();
+    listEl.innerHTML = '';
+    if (polls.length === 0) {
+      const empty = document.createElement('p');
+      empty.className = 'poll-empty';
+      empty.textContent = 'No polls yet. Create the first one!';
+      listEl.appendChild(empty);
+      return;
+    }
+    for (const poll of polls) {
+      listEl.appendChild(pollRenderCard(poll));
+    }
+  }
+
+  function pollRenderCard(poll) {
+    const card = document.createElement('div');
+    card.className = 'poll-card' + (poll.closed_at ? ' closed' : '');
+    card.setAttribute('data-poll-id', poll.id);
+
+    // Header
+    const header = document.createElement('div');
+    header.className = 'poll-card-header';
+
+    const q = document.createElement('div');
+    q.className = 'poll-question';
+    q.textContent = poll.question || '';
+    header.appendChild(q);
+
+    const localIdentity = pollLocalIdentity();
+    const isCreator = localIdentity && poll.creator_identity === localIdentity;
+    if (isCreator && !poll.closed_at) {
+      const closeBtn = document.createElement('button');
+      closeBtn.className = 'poll-close-btn';
+      closeBtn.type = 'button';
+      closeBtn.textContent = 'Close';
+      closeBtn.title = 'Close this poll';
+      closeBtn.addEventListener('click', () => pollClosePoll(poll.id));
+      header.appendChild(closeBtn);
+    }
+
+    card.appendChild(header);
+
+    // Meta
+    const meta = document.createElement('div');
+    meta.className = 'poll-meta';
+    const typeLabel = poll.poll_type === 'multiple' ? 'Multiple choice' : 'Single choice';
+    meta.textContent = typeLabel;
+    card.appendChild(meta);
+
+    const showResults = !!poll.closed_at || poll._voted;
+    const disabled = !!poll.closed_at;
+
+    if (showResults) {
+      card.appendChild(pollRenderResults(poll));
+    } else {
+      card.appendChild(pollRenderInputs(poll));
+    }
+
+    // Actions
+    const actions = document.createElement('div');
+    actions.className = 'poll-actions';
+
+    if (poll.closed_at) {
+      const closedLbl = document.createElement('span');
+      closedLbl.className = 'poll-status closed';
+      closedLbl.textContent = 'Poll closed';
+      actions.appendChild(closedLbl);
+    } else {
+      const voteBtn = document.createElement('button');
+      voteBtn.className = 'poll-vote-btn';
+      voteBtn.type = 'button';
+      voteBtn.textContent = poll._voted ? 'Update vote' : 'Vote';
+      voteBtn.disabled = !((poll._selectedIndexes || []).length > 0) || pollState.inflight.has(poll.id);
+      voteBtn.addEventListener('click', () => pollSubmitVote(poll.id));
+      actions.appendChild(voteBtn);
+    }
+
+    card.appendChild(actions);
+
+    if (poll._error) {
+      const err = document.createElement('p');
+      err.className = 'poll-card-error';
+      err.textContent = poll._error;
+      card.appendChild(err);
+    }
+
+    return card;
+  }
+
+  function pollRenderInputs(poll) {
+    const container = document.createElement('div');
+    container.className = 'poll-options';
+    const isMulti = poll.poll_type === 'multiple';
+    const selected = new Set(poll._selectedIndexes || []);
+
+    (poll.options || []).forEach((opt, idx) => {
+      const row = document.createElement('label');
+      row.className = 'poll-option-input';
+
+      const input = document.createElement('input');
+      input.type = isMulti ? 'checkbox' : 'radio';
+      input.name = 'poll-' + poll.id;
+      input.value = String(idx);
+      input.checked = selected.has(idx);
+      input.addEventListener('change', () => {
+        const cur = pollState.polls.get(poll.id);
+        if (!cur) return;
+        if (isMulti) {
+          const set = new Set(cur._selectedIndexes || []);
+          if (input.checked) set.add(idx);
+          else set.delete(idx);
+          cur._selectedIndexes = Array.from(set);
+        } else {
+          cur._selectedIndexes = input.checked ? [idx] : [];
+        }
+        cur._error = null;
+        pollState.polls.set(poll.id, cur);
+        pollRenderList();
+      });
+
+      const text = document.createElement('span');
+      text.textContent = String(opt);
+
+      row.appendChild(input);
+      row.appendChild(text);
+      container.appendChild(row);
+    });
+
+    return container;
+  }
+
+  function pollRenderResults(poll) {
+    const container = document.createElement('div');
+    container.className = 'poll-results';
+
+    const counts = poll.option_counts || [];
+    const total = counts.reduce((a, b) => a + (Number(b) || 0), 0);
+
+    if (total === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'poll-results-empty';
+      empty.textContent = 'No votes yet';
+      // Still show the options as 0-bars so users know what the poll is about.
+      (poll.options || []).forEach((opt) => {
+        container.appendChild(pollRenderBar(String(opt), 0, 0));
+      });
+      container.insertBefore(empty, container.firstChild);
+      return container;
+    }
+
+    (poll.options || []).forEach((opt, idx) => {
+      const n = Number(counts[idx] || 0);
+      const pct = total > 0 ? Math.round((n / total) * 100) : 0;
+      container.appendChild(pollRenderBar(String(opt), n, pct));
+    });
+
+    const summary = document.createElement('div');
+    summary.className = 'poll-meta';
+    const voterCount = poll.total_voters != null ? Number(poll.total_voters) : total;
+    summary.textContent = voterCount + ' ' + (voterCount === 1 ? 'voter' : 'voters');
+    container.appendChild(summary);
+
+    return container;
+  }
+
+  function pollRenderBar(label, count, pct) {
+    const wrapper = document.createElement('div');
+    wrapper.className = 'poll-bar';
+
+    const head = document.createElement('div');
+    head.className = 'poll-bar-header';
+    const lblEl = document.createElement('span');
+    lblEl.className = 'poll-bar-label';
+    lblEl.textContent = label;
+    const cnt = document.createElement('span');
+    cnt.className = 'poll-bar-count';
+    cnt.textContent = count + ' (' + pct + '%)';
+    head.appendChild(lblEl);
+    head.appendChild(cnt);
+
+    const track = document.createElement('div');
+    track.className = 'poll-bar-track';
+    const fill = document.createElement('div');
+    fill.className = 'poll-bar-fill';
+    fill.style.width = Math.max(0, Math.min(100, pct)) + '%';
+    track.appendChild(fill);
+
+    wrapper.appendChild(head);
+    wrapper.appendChild(track);
+    return wrapper;
+  }
+
+  async function pollSubmitVote(pollId) {
+    const poll = pollState.polls.get(pollId);
+    if (!poll) return;
+    if (poll.closed_at) return; // Guard: closed
+    if (pollState.inflight.has(pollId)) return;
+
+    const voterIdentity = pollLocalIdentity();
+    if (!voterIdentity) {
+      poll._error = 'Not connected to the call.';
+      pollState.polls.set(pollId, poll);
+      pollRenderList();
+      return;
+    }
+
+    const indexes = (poll._selectedIndexes || []).slice();
+    if (indexes.length === 0) return;
+
+    if (poll.poll_type === 'multiple') {
+      if (indexes.length < 1 || indexes.length > 6) {
+        poll._error = 'Pick between 1 and 6 options.';
+        pollState.polls.set(pollId, poll);
+        pollRenderList();
+        return;
+      }
+    } else if (indexes.length !== 1) {
+      poll._error = 'Pick one option.';
+      pollState.polls.set(pollId, poll);
+      pollRenderList();
+      return;
+    }
+
+    pollState.inflight.add(pollId);
+    poll._error = null;
+    pollState.polls.set(pollId, poll);
+    pollRenderList();
+
+    try {
+      const result = await apiCall('vote_poll', {
+        p_poll_id: pollId,
+        p_voter_identity: voterIdentity,
+        p_option_indexes: indexes,
+      });
+      if (result && result.error) {
+        const cur = pollState.polls.get(pollId) || poll;
+        cur._error = result.error;
+        pollState.polls.set(pollId, cur);
+        pollRenderList();
+        return;
+      }
+      const cur = pollState.polls.get(pollId) || poll;
+      cur._voted = true;
+      cur._error = null;
+      pollState.polls.set(pollId, cur);
+      // Fan out to other clients + refetch counts for ourselves.
+      await pollPublishDataPacket({ type: 'poll_vote_update', pollId });
+      await pollFetchResults(pollId);
+    } catch (e) {
+      console.error('vote_poll failed:', e);
+      const cur = pollState.polls.get(pollId) || poll;
+      cur._error = 'Failed to submit vote.';
+      pollState.polls.set(pollId, cur);
+      pollRenderList();
+    } finally {
+      pollState.inflight.delete(pollId);
+    }
+  }
+
+  async function pollClosePoll(pollId) {
+    const poll = pollState.polls.get(pollId);
+    if (!poll) return;
+    if (pollState.inflight.has(pollId)) return;
+    const identity = pollLocalIdentity();
+    if (!identity) return;
+
+    pollState.inflight.add(pollId);
+    try {
+      const result = await apiCall('close_poll', {
+        p_poll_id: pollId,
+        p_closer_identity: identity,
+      });
+      if (result && result.error) {
+        const cur = pollState.polls.get(pollId) || poll;
+        cur._error = result.error;
+        pollState.polls.set(pollId, cur);
+        pollRenderList();
+        return;
+      }
+      // Refetch full results (which include closed_at + counts).
+      await pollFetchResults(pollId);
+      await pollPublishDataPacket({ type: 'poll_closed', pollId });
+    } catch (e) {
+      console.error('close_poll failed:', e);
+      const cur = pollState.polls.get(pollId) || poll;
+      cur._error = 'Failed to close poll.';
+      pollState.polls.set(pollId, cur);
+      pollRenderList();
+    } finally {
+      pollState.inflight.delete(pollId);
+    }
+  }
+
+  // --- Create-poll modal ---
+
+  function pollOpenCreateModal() {
+    if (!state.room) {
+      // Guard: can't create a poll before the room is connected.
+      console.warn('poll: cannot create before connected');
+      return;
+    }
+    $('poll-question-input').value = '';
+    const singleRadio = document.querySelector('input[name="poll-type"][value="single"]');
+    if (singleRadio) singleRadio.checked = true;
+    $('poll-create-error').classList.add('hidden');
+    $('poll-create-error').textContent = '';
+
+    // Reset to 2 empty option rows.
+    const list = $('poll-options-list');
+    list.innerHTML = '';
+    pollAddOptionRow('');
+    pollAddOptionRow('');
+    pollUpdateCreateValidity();
+
+    $('poll-create-modal').classList.remove('hidden');
+    setTimeout(() => $('poll-question-input').focus(), 50);
+  }
+
+  function pollCloseCreateModal() {
+    $('poll-create-modal').classList.add('hidden');
+  }
+
+  function pollAddOptionRow(initial) {
+    const list = $('poll-options-list');
+    const existing = list.querySelectorAll('.poll-option-row').length;
+    if (existing >= 6) return;
+
+    const row = document.createElement('div');
+    row.className = 'poll-option-row';
+
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'poll-input poll-option-text';
+    input.placeholder = 'Option ' + (existing + 1);
+    input.maxLength = 200;
+    input.value = initial || '';
+    input.addEventListener('input', pollUpdateCreateValidity);
+
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'poll-option-remove';
+    remove.textContent = '×';
+    remove.title = 'Remove option';
+    remove.addEventListener('click', () => {
+      // Must keep at least 2 rows.
+      const rows = list.querySelectorAll('.poll-option-row');
+      if (rows.length <= 2) return;
+      row.remove();
+      pollUpdateCreateValidity();
+      pollUpdateAddOptionButton();
+    });
+
+    row.appendChild(input);
+    row.appendChild(remove);
+    list.appendChild(row);
+    pollUpdateAddOptionButton();
+  }
+
+  function pollUpdateAddOptionButton() {
+    const count = $('poll-options-list').querySelectorAll('.poll-option-row').length;
+    const btn = $('btn-add-option');
+    if (!btn) return;
+    btn.disabled = count >= 6;
+  }
+
+  function pollCollectCreateValues() {
+    const question = $('poll-question-input').value.trim();
+    const type = (document.querySelector('input[name="poll-type"]:checked') || {}).value || 'single';
+    const options = Array.from($('poll-options-list').querySelectorAll('.poll-option-text'))
+      .map((i) => i.value.trim())
+      .filter((v) => v.length > 0);
+    return { question, type, options };
+  }
+
+  function pollUpdateCreateValidity() {
+    const { question, options } = pollCollectCreateValues();
+    const valid = question.length > 0 && options.length >= 2;
+    $('btn-submit-create-poll').disabled = !valid;
+  }
+
+  async function pollSubmitCreate() {
+    const { question, type, options } = pollCollectCreateValues();
+    const roomName = pollRoomName();
+    const creatorIdentity = pollLocalIdentity();
+    const errEl = $('poll-create-error');
+    errEl.classList.add('hidden');
+    errEl.textContent = '';
+
+    if (!roomName || !creatorIdentity) {
+      errEl.textContent = 'Not connected to the call.';
+      errEl.classList.remove('hidden');
+      return;
+    }
+    if (!question) {
+      errEl.textContent = 'Question is required.';
+      errEl.classList.remove('hidden');
+      return;
+    }
+    if (options.length < 2) {
+      errEl.textContent = 'Add at least 2 options.';
+      errEl.classList.remove('hidden');
+      return;
+    }
+    if (options.length > 6) {
+      errEl.textContent = 'Maximum 6 options.';
+      errEl.classList.remove('hidden');
+      return;
+    }
+
+    const submitBtn = $('btn-submit-create-poll');
+    submitBtn.disabled = true;
+
+    try {
+      const result = await apiCall('create_poll', {
+        p_room_name: roomName,
+        p_creator_identity: creatorIdentity,
+        p_question: question,
+        p_options: options,
+        p_poll_type: type,
+      });
+
+      if (result && result.error) {
+        errEl.textContent = result.error;
+        errEl.classList.remove('hidden');
+        submitBtn.disabled = false;
+        return;
+      }
+
+      // Optimistic: prepend to local cache.
+      if (result && result.id) {
+        pollState.polls.set(result.id, {
+          id: result.id,
+          question: result.question || question,
+          options: result.options || options,
+          poll_type: result.poll_type || type,
+          room_name: result.room_name || roomName,
+          creator_identity: result.creator_identity || creatorIdentity,
+          created_at: result.created_at || new Date().toISOString(),
+          option_counts: new Array(options.length).fill(0),
+          total_voters: 0,
+          _selectedIndexes: [],
+          _voted: false,
+        });
+        pollRenderList();
+
+        // Fan out to other clients so they refetch the active list.
+        await pollPublishDataPacket({ type: 'poll_new', pollId: result.id });
+      } else {
+        // Fallback: refetch full list.
+        await pollListActive();
+      }
+
+      pollCloseCreateModal();
+    } catch (e) {
+      console.error('create_poll failed:', e);
+      errEl.textContent = 'Failed to create poll.';
+      errEl.classList.remove('hidden');
+      submitBtn.disabled = false;
+    }
+  }
+
+  function pollHandleDataPacket(msg) {
+    if (!msg || !msg.type) return;
+    if (msg.type === 'poll_new') {
+      pollListActive();
+    } else if (msg.type === 'poll_vote_update') {
+      if (msg.pollId) pollFetchResults(msg.pollId);
+    } else if (msg.type === 'poll_closed') {
+      if (msg.pollId) pollFetchResults(msg.pollId);
+    }
+  }
+
+  function setupPollControls() {
+    const btnPolls = $('btn-polls');
+    if (btnPolls) btnPolls.addEventListener('click', pollPanelToggle);
+    const btnClose = $('btn-close-polls');
+    if (btnClose) btnClose.addEventListener('click', pollPanelClose);
+    const btnOpenCreate = $('btn-open-create-poll');
+    if (btnOpenCreate) btnOpenCreate.addEventListener('click', pollOpenCreateModal);
+    const btnCancelCreate = $('btn-cancel-create-poll');
+    if (btnCancelCreate) btnCancelCreate.addEventListener('click', pollCloseCreateModal);
+    const btnCloseCreate = $('btn-close-create-poll');
+    if (btnCloseCreate) btnCloseCreate.addEventListener('click', pollCloseCreateModal);
+    const btnSubmitCreate = $('btn-submit-create-poll');
+    if (btnSubmitCreate) btnSubmitCreate.addEventListener('click', pollSubmitCreate);
+    const btnAddOption = $('btn-add-option');
+    if (btnAddOption) btnAddOption.addEventListener('click', () => pollAddOptionRow(''));
+    const questionInput = $('poll-question-input');
+    if (questionInput) questionInput.addEventListener('input', pollUpdateCreateValidity);
+    // Dismiss modal on backdrop click.
+    const backdrop = document.querySelector('.poll-create-backdrop');
+    if (backdrop) backdrop.addEventListener('click', pollCloseCreateModal);
   }
 
   // ------------------------------------
