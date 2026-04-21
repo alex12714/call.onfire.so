@@ -408,6 +408,15 @@
             </svg>
             <span id="poll-badge" class="chat-badge hidden">0</span>
           </button>
+          <button id="btn-breakouts" class="control-btn hidden" title="Breakout rooms">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="3" width="7" height="7" rx="1"/>
+              <rect x="14" y="3" width="7" height="7" rx="1"/>
+              <rect x="3" y="14" width="7" height="7" rx="1"/>
+              <rect x="14" y="14" width="7" height="7" rx="1"/>
+            </svg>
+            <span id="breakout-help-badge" class="chat-badge hidden">0</span>
+          </button>
           <button id="btn-screen-share" class="control-btn control-btn-screen-share" title="Share Screen">
             <svg class="icon-screen-share-off" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>
@@ -494,6 +503,112 @@
             </svg>
           </button>
         </div>
+      </div>
+
+      <!-- Breakouts: in-breakout banner (shown while a participant is inside a breakout room) -->
+      <div id="breakout-banner" class="breakout-banner hidden">
+        <div class="breakout-banner-left">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="3" width="7" height="7" rx="1"/>
+            <rect x="14" y="3" width="7" height="7" rx="1"/>
+            <rect x="3" y="14" width="7" height="7" rx="1"/>
+            <rect x="14" y="14" width="7" height="7" rx="1"/>
+          </svg>
+          <span id="breakout-banner-label">Breakout</span>
+          <span class="breakout-banner-sep">•</span>
+          <span id="breakout-banner-timer" class="breakout-timer">--:--</span>
+        </div>
+        <div class="breakout-banner-right">
+          <button id="btn-breakout-help" type="button" class="breakout-banner-btn breakout-help-btn">Request help</button>
+          <button id="btn-breakout-leave" type="button" class="breakout-banner-btn breakout-leave-btn">Leave breakout</button>
+        </div>
+      </div>
+
+      <!-- Breakouts: host "visiting" banner (shown when host visits one of their own breakouts) -->
+      <div id="breakout-host-visit-banner" class="breakout-host-visit-banner hidden">
+        <span>You are visiting as host</span>
+        <button id="btn-breakout-return-main" type="button" class="breakout-banner-btn">Return to main</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Breakouts: pre-switch takeover overlay (participant seeing "You're being moved to Room N") -->
+  <div id="breakout-assign-overlay" class="breakout-assign-overlay hidden">
+    <div class="breakout-assign-card">
+      <div class="breakout-assign-icon">
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="3" width="7" height="7" rx="1"/>
+          <rect x="14" y="3" width="7" height="7" rx="1"/>
+          <rect x="3" y="14" width="7" height="7" rx="1"/>
+          <rect x="14" y="14" width="7" height="7" rx="1"/>
+        </svg>
+      </div>
+      <h2>You're being moved</h2>
+      <p id="breakout-assign-room-label">Room</p>
+      <p class="breakout-assign-countdown">Switching in <span id="breakout-assign-seconds">3</span>s...</p>
+      <button id="btn-breakout-assign-cancel" class="btn btn-secondary">Cancel</button>
+    </div>
+  </div>
+
+  <!-- Breakouts: host panel (modal sheet) -->
+  <div id="breakout-panel" class="breakout-panel hidden">
+    <div class="breakout-panel-backdrop"></div>
+    <div class="breakout-panel-sheet">
+      <div class="breakout-panel-header">
+        <h3 id="breakout-panel-title">Breakout rooms</h3>
+        <button id="btn-close-breakout" class="chat-close-btn" title="Close">&times;</button>
+      </div>
+
+      <!-- Create view (shown when no active session) -->
+      <div id="breakout-create-view" class="breakout-panel-body">
+        <div class="breakout-field">
+          <label class="breakout-field-label" for="breakout-room-count">Number of rooms</label>
+          <input type="number" id="breakout-room-count" class="breakout-input" min="2" max="20" value="3">
+        </div>
+        <div class="breakout-field">
+          <label class="breakout-field-label" for="breakout-duration">Duration (minutes)</label>
+          <input type="number" id="breakout-duration" class="breakout-input" min="1" max="120" value="15">
+        </div>
+        <div class="breakout-field">
+          <label class="breakout-field-label">Assignment</label>
+          <div class="breakout-mode-group">
+            <label class="breakout-mode-option">
+              <input type="radio" name="breakout-mode" value="auto" checked>
+              <span>Auto (round-robin)</span>
+            </label>
+            <label class="breakout-mode-option">
+              <input type="radio" name="breakout-mode" value="manual">
+              <span>Manual (drag-drop)</span>
+            </label>
+          </div>
+        </div>
+        <div id="breakout-manual-assign" class="breakout-manual-assign hidden">
+          <p class="breakout-help-text">Drag each participant into a room column.</p>
+          <div id="breakout-unassigned-row" class="breakout-unassigned-row" data-room-id="unassigned"></div>
+          <div id="breakout-rooms-grid" class="breakout-rooms-grid"></div>
+        </div>
+        <p id="breakout-create-error" class="breakout-create-error hidden"></p>
+      </div>
+
+      <!-- Active session view -->
+      <div id="breakout-active-view" class="breakout-panel-body hidden">
+        <div id="breakout-timer-banner" class="breakout-timer-banner">
+          <span>Time remaining</span>
+          <strong id="breakout-panel-timer">--:--</strong>
+        </div>
+        <div id="breakout-help-requests" class="breakout-help-requests"></div>
+        <div id="breakout-active-rooms-grid" class="breakout-active-rooms-grid"></div>
+        <div class="breakout-broadcast-area">
+          <label class="breakout-field-label" for="breakout-broadcast-input">Broadcast to all rooms</label>
+          <textarea id="breakout-broadcast-input" class="breakout-input" rows="2" maxlength="500" placeholder="Message to all breakouts..."></textarea>
+          <button id="btn-breakout-broadcast" class="btn btn-secondary breakout-broadcast-btn" disabled>Send to all rooms</button>
+        </div>
+      </div>
+
+      <div class="breakout-panel-footer">
+        <button id="btn-breakout-cancel" class="btn btn-secondary">Close</button>
+        <button id="btn-breakout-create" class="btn btn-primary">Create Session</button>
+        <button id="btn-breakout-end" class="btn btn-primary hidden">End now</button>
       </div>
     </div>
   </div>

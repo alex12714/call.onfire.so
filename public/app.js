@@ -35,6 +35,18 @@
     pollTimer: null,       // Polling timer for start-meeting flow
     hasSeenInitialRoster: false, // true ~2s after Connected; suppresses join chime for pre-existing participants
     isHandRaised: false,   // Local raise-hand UI state; mirrors localParticipant.attributes.handRaised
+    isHost: false,         // True when ?forceHost=1 is set or joinData.is_host — gates breakout host UI
+    guestName: null,       // Cached guest name so we can re-join main room on breakout_ended
+    breakoutSession: null, // Active breakout session (host-side) or attached state (participant)
+    inBreakout: false,     // True while participant is inside a breakout room
+    breakoutParentRoom: null, // Main room name (parent) when inside a breakout
+    breakoutClosesAt: null,   // ISO string / ms timestamp for client-side countdown
+    breakoutRoomLabel: null,  // Friendly "Room N" label for banner
+    breakoutLastBroadcastAt: null, // Last-seen broadcast_at to dedupe toasts
+    breakoutPollTimer: null,  // setInterval for get_breakout_session poll
+    breakoutTimerTick: null,  // setInterval for UI countdown ticking
+    breakoutAssignTimer: null, // setTimeout for the 3-second pre-switch takeover
+    breakoutHelpInflight: false,
   };
 
   // Toast queue for "X raised their hand" notifications.
@@ -380,6 +392,9 @@
       }
 
       state.joinData = data;
+      state.guestName = guestName;
+      // Honor server-side is_host; fall back to forceHost dev shortcut (read in init()).
+      if (data && data.is_host) state.isHost = true;
 
       stopVideoPreview();
       await startCall(data);
@@ -463,6 +478,10 @@
 
       // Late-joiner catchup: pull any active polls for this room.
       pollListActive().catch((e) => console.warn('pollListActive failed on join:', e));
+
+      // Breakouts: reveal the host-only button (if this is a host) and pull any
+      // active breakout session so a host that rejoins sees existing state.
+      breakoutsOnCallJoined();
 
     } catch (err) {
       console.error('Call start error:', err);
@@ -588,22 +607,20 @@
           pollHandleDataPacket(msg);
         } else if (msg.type === 'breakout_assign') {
           // Host split us into a breakout room. Server embeds the new token
-          // in the packet so there's no extra round-trip; switch locally.
-          switchRoom({
-            serverUrl: msg.server_url || (state.joinData && state.joinData.server_url),
-            token: msg.token,
-            newRoomName: msg.room_name,
-            reason: 'host_moved_to_breakout',
-          }).catch((e) => console.warn('switchRoom (breakout_assign) failed:', e));
+          // in the packet. Show a 3-second takeover then switch.
+          handleBreakoutAssign(msg).catch((e) => console.warn('handleBreakoutAssign failed:', e));
         } else if (msg.type === 'breakout_ended') {
-          // Timer worker (or host) ended the breakout. Server sends a token
-          // minted for the parent room.
-          switchRoom({
-            serverUrl: msg.server_url || (state.joinData && state.joinData.server_url),
-            token: msg.token,
-            newRoomName: msg.room_name,
-            reason: 'breakout_timer_expired',
-          }).catch((e) => console.warn('switchRoom (breakout_ended) failed:', e));
+          // Timer worker (or host) ended the breakout. The worker only sends
+          // `{type, main_room}` — no new token. We must mint one client-side
+          // by calling joinCallAsGuest with the cached guestName.
+          handleBreakoutEnded(msg).catch((e) => console.warn('handleBreakoutEnded failed:', e));
+        } else if (msg.type === 'breakout_broadcast') {
+          // In-call announcement from the host. Deduped against the poll.
+          showBreakoutBroadcastToast(msg.message || '', msg.broadcast_at || null);
+        } else if (msg.type === 'breakout_help_requested') {
+          // Host-only signal. Our help-requests list refreshes via poll; this
+          // is just the badge nudge so the host sees something immediately.
+          if (state.isHost) bumpBreakoutHelpBadge();
         }
       } catch (e) {
         // Ignore non-chat data
@@ -995,6 +1012,9 @@
 
     // Polls
     setupPollControls();
+
+    // Breakouts
+    setupBreakoutControls();
   }
 
   // ------------------------------------
@@ -1228,6 +1248,9 @@
     // Clean up audio playback UI and attached remote audio elements
     hideEnableAudioPrompt();
     document.querySelectorAll('audio[data-onfire-remote-audio]').forEach((el) => el.remove());
+
+    // Clear breakout state and UI
+    breakoutsTearDown();
 
     // Clear poll state and close poll UI
     pollState.polls.clear();
@@ -1487,6 +1510,895 @@
     if (bytes < 1024) return bytes + ' B';
     if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
     return (bytes / 1048576).toFixed(1) + ' MB';
+  }
+
+  // ------------------------------------
+  // Breakouts Module (host + participant UI)
+  // ------------------------------------
+  // Architecture recap (see ADR 0001):
+  //   - Breakout rooms named "<mainroom>:br:<N>".
+  //   - Host creates session via /rpc/create_breakout_session. Server returns
+  //     per-assignment LiveKit tokens. Host fans them out via DataPacket with
+  //     destinationIdentities so only the targeted participant gets moved.
+  //   - Timer worker posts {type:'breakout_ended', main_room} to each breakout
+  //     room when the timer expires OR when a host ends early. Clients re-mint
+  //     their own main-room token via joinCallAsGuest (worker doesn't send one).
+  //   - Host broadcast persists server-side on the session row; clients poll
+  //     get_breakout_session every 5s while in a breakout and show new broadcasts
+  //     as toasts (we can't publishData to rooms we're not connected to).
+
+  const BREAKOUT_POLL_INTERVAL_MS = 5000;
+  const BREAKOUT_ASSIGN_COUNTDOWN_S = 3;
+
+  // ---- Helpers ----
+  function breakoutsLocalIdentity() {
+    return (state.room && state.room.localParticipant && state.room.localParticipant.identity) || null;
+  }
+
+  function breakoutsLocalName() {
+    return (state.room && state.room.localParticipant && state.room.localParticipant.name)
+      || state.guestName
+      || 'You';
+  }
+
+  function breakoutsParentRoom() {
+    // Parent = main room. While inside a breakout we've cached it; otherwise
+    // the current room name is the parent.
+    if (state.breakoutParentRoom) return state.breakoutParentRoom;
+    const jd = state.joinData || {};
+    return jd.room_name || jd.roomName || (state.room && state.room.name) || null;
+  }
+
+  function breakoutsOnCallJoined() {
+    const btn = $('btn-breakouts');
+    if (btn) {
+      // Show only to hosts. Gate is state.isHost (from joinData.is_host OR
+      // ?forceHost=1 dev shortcut).
+      if (state.isHost) btn.classList.remove('hidden');
+      else btn.classList.add('hidden');
+    }
+
+    // If a host rejoins and there's an active breakout session, pick it up.
+    if (state.isHost) {
+      breakoutFetchSession().catch((e) => console.warn('breakoutFetchSession failed on join:', e));
+    }
+  }
+
+  function breakoutsTearDown() {
+    // Stop polls + timers regardless of which mode we were in.
+    if (state.breakoutPollTimer) { clearInterval(state.breakoutPollTimer); state.breakoutPollTimer = null; }
+    if (state.breakoutTimerTick) { clearInterval(state.breakoutTimerTick); state.breakoutTimerTick = null; }
+    if (state.breakoutAssignTimer) { clearTimeout(state.breakoutAssignTimer); state.breakoutAssignTimer = null; }
+
+    state.breakoutSession = null;
+    state.inBreakout = false;
+    state.breakoutParentRoom = null;
+    state.breakoutClosesAt = null;
+    state.breakoutRoomLabel = null;
+    state.breakoutLastBroadcastAt = null;
+    state.breakoutHelpInflight = false;
+
+    // UI resets
+    const panel = $('breakout-panel'); if (panel) panel.classList.add('hidden');
+    const banner = $('breakout-banner'); if (banner) banner.classList.add('hidden');
+    const hostVisit = $('breakout-host-visit-banner'); if (hostVisit) hostVisit.classList.add('hidden');
+    const overlay = $('breakout-assign-overlay'); if (overlay) overlay.classList.add('hidden');
+    const badge = $('breakout-help-badge'); if (badge) { badge.textContent = '0'; badge.classList.add('hidden'); }
+  }
+
+  function bumpBreakoutHelpBadge() {
+    const badge = $('breakout-help-badge');
+    if (!badge) return;
+    const cur = parseInt(badge.textContent || '0', 10) || 0;
+    badge.textContent = String(cur + 1);
+    badge.classList.remove('hidden');
+  }
+
+  function resetBreakoutHelpBadge() {
+    const badge = $('breakout-help-badge');
+    if (!badge) return;
+    badge.textContent = '0';
+    badge.classList.add('hidden');
+  }
+
+  // ---- RPC wrappers ----
+  async function rpcCreateBreakoutSession(parentRoom, durationSeconds, roomCount, autoAssign, assignments) {
+    return apiCall('create_breakout_session', {
+      p_parent_room: parentRoom,
+      p_creator_identity: breakoutsLocalIdentity(),
+      p_duration_seconds: durationSeconds,
+      p_room_count: roomCount,
+      p_auto_assign: autoAssign,
+      p_assignments: assignments || null,
+    });
+  }
+
+  async function rpcAutoAssign(sessionId, identities) {
+    return apiCall('auto_assign_breakout_participants', {
+      p_session_id: sessionId,
+      p_participant_identities: identities,
+    });
+  }
+
+  async function rpcJoinBreakoutRoom(sessionId, roomId, identity) {
+    return apiCall('join_breakout_room', {
+      p_session_id: sessionId,
+      p_room_id: roomId,
+      p_participant_identity: identity,
+    });
+  }
+
+  async function rpcMoveParticipant(sessionId, identity, targetRoomId) {
+    return apiCall('move_participant_to_breakout', {
+      p_session_id: sessionId,
+      p_participant_identity: identity,
+      p_target_room_id: targetRoomId,
+      p_mover_identity: breakoutsLocalIdentity(),
+    });
+  }
+
+  async function rpcBroadcast(sessionId, message) {
+    return apiCall('broadcast_to_breakouts', {
+      p_session_id: sessionId,
+      p_message: message,
+      p_sender_identity: breakoutsLocalIdentity(),
+    });
+  }
+
+  async function rpcEndSession(sessionId) {
+    return apiCall('end_breakout_session', {
+      p_session_id: sessionId,
+      p_ender_identity: breakoutsLocalIdentity(),
+    });
+  }
+
+  async function rpcRequestHelp(sessionId, roomId) {
+    return apiCall('request_breakout_help', {
+      p_session_id: sessionId,
+      p_room_id: roomId,
+      p_requester_identity: breakoutsLocalIdentity(),
+    });
+  }
+
+  async function rpcResolveHelp(helpId) {
+    return apiCall('resolve_help_request', {
+      p_help_id: helpId,
+      p_resolver_identity: breakoutsLocalIdentity(),
+    });
+  }
+
+  async function rpcGetSession(parentRoom) {
+    return apiCall('get_breakout_session', { p_parent_room: parentRoom });
+  }
+
+  // ---- Participant: assignment takeover + switch ----
+  async function handleBreakoutAssign(msg) {
+    // Reject if we're already mid-switch or already in a breakout.
+    if (!msg || !msg.token || !msg.room_name) return;
+    if (state.inBreakout) return; // ignore duplicate assigns
+
+    const overlay = $('breakout-assign-overlay');
+    const label = msg.room_label || msg.room_name || 'Breakout room';
+    $('breakout-assign-room-label').textContent = label;
+    const secEl = $('breakout-assign-seconds');
+
+    let remaining = BREAKOUT_ASSIGN_COUNTDOWN_S;
+    secEl.textContent = String(remaining);
+    overlay.classList.remove('hidden');
+
+    let cancelled = false;
+    const onCancel = () => { cancelled = true; };
+    const cancelBtn = $('btn-breakout-assign-cancel');
+    cancelBtn.onclick = onCancel;
+
+    // Tick once per second. Prefer requestAnimationFrame-less setInterval to avoid
+    // tab-throttling surprises; 1s is coarse enough.
+    const tick = setInterval(() => {
+      remaining -= 1;
+      if (remaining <= 0) {
+        clearInterval(tick);
+      } else {
+        secEl.textContent = String(remaining);
+      }
+    }, 1000);
+
+    state.breakoutAssignTimer = setTimeout(async () => {
+      clearInterval(tick);
+      overlay.classList.add('hidden');
+      if (cancelled) return;
+
+      // Cache parent-room metadata so we can return on breakout_ended.
+      state.breakoutParentRoom = (state.joinData && state.joinData.room_name) || null;
+      state.breakoutClosesAt = msg.closes_at || (msg.duration_seconds
+        ? new Date(Date.now() + msg.duration_seconds * 1000).toISOString()
+        : null);
+      state.breakoutRoomLabel = label;
+
+      try {
+        await switchRoom({
+          serverUrl: msg.server_url || (state.joinData && state.joinData.server_url),
+          token: msg.token,
+          newRoomName: msg.room_name,
+          reason: 'host_moved_to_breakout',
+        });
+        state.inBreakout = true;
+        showBreakoutBanner();
+        startBreakoutPollLoop();
+        startBreakoutTimerTick();
+      } catch (e) {
+        console.warn('switchRoom (breakout_assign) failed:', e);
+      }
+    }, BREAKOUT_ASSIGN_COUNTDOWN_S * 1000);
+  }
+
+  async function handleBreakoutEnded(msg) {
+    // Worker sends `{type:'breakout_ended', main_room}`. No token — we re-mint.
+    const parent = (msg && msg.main_room) || state.breakoutParentRoom;
+    if (!parent) {
+      console.warn('handleBreakoutEnded: no main_room hint; ignoring');
+      return;
+    }
+    showSimpleToast('Breakout ended. Returning to main room...');
+
+    // For the guest-only web flow we always have a cached token (state.token
+    // is the call link slug). Use joinCallAsGuest to mint a fresh main-room token.
+    try {
+      const data = await joinCallAsGuest(state.token, breakoutsLocalName());
+      if (!data || data.error) {
+        console.error('breakout_ended rejoin failed:', data && data.error);
+        return;
+      }
+      // Update cached join data so subsequent code paths target the main room.
+      state.joinData = data;
+      await switchRoom({
+        serverUrl: data.server_url,
+        token: data.token,
+        newRoomName: data.room_name,
+        reason: 'breakout_ended',
+      });
+      // Tear down breakout-mode UI after successful return.
+      stopBreakoutPollLoop();
+      stopBreakoutTimerTick();
+      state.inBreakout = false;
+      state.breakoutParentRoom = null;
+      state.breakoutClosesAt = null;
+      state.breakoutRoomLabel = null;
+      hideBreakoutBanner();
+      hideHostVisitBanner();
+    } catch (e) {
+      console.error('handleBreakoutEnded rejoin threw:', e);
+    }
+  }
+
+  // ---- Participant banner + timer ----
+  function showBreakoutBanner() {
+    const banner = $('breakout-banner');
+    if (!banner) return;
+    $('breakout-banner-label').textContent = state.breakoutRoomLabel || 'Breakout';
+    banner.classList.remove('hidden');
+  }
+  function hideBreakoutBanner() {
+    const banner = $('breakout-banner');
+    if (banner) banner.classList.add('hidden');
+  }
+
+  function showHostVisitBanner() {
+    const el = $('breakout-host-visit-banner');
+    if (el) el.classList.remove('hidden');
+  }
+  function hideHostVisitBanner() {
+    const el = $('breakout-host-visit-banner');
+    if (el) el.classList.add('hidden');
+  }
+
+  function breakoutTimerString() {
+    if (!state.breakoutClosesAt) return '--:--';
+    const ms = new Date(state.breakoutClosesAt).getTime() - Date.now();
+    if (isNaN(ms)) return '--:--';
+    if (ms <= 0) return 'Closing...';
+    const s = Math.floor(ms / 1000);
+    const m = Math.floor(s / 60);
+    const ss = s % 60;
+    return `${String(m).padStart(2, '0')}:${String(ss).padStart(2, '0')}`;
+  }
+
+  function startBreakoutTimerTick() {
+    stopBreakoutTimerTick();
+    const tick = () => {
+      const s = breakoutTimerString();
+      const bt = $('breakout-banner-timer'); if (bt) bt.textContent = s;
+      const pt = $('breakout-panel-timer'); if (pt) pt.textContent = s;
+    };
+    tick();
+    state.breakoutTimerTick = setInterval(tick, 1000);
+  }
+  function stopBreakoutTimerTick() {
+    if (state.breakoutTimerTick) { clearInterval(state.breakoutTimerTick); state.breakoutTimerTick = null; }
+  }
+
+  // ---- Broadcast toast ----
+  function showBreakoutBroadcastToast(message, broadcastAt) {
+    if (!message) return;
+    // Dedupe: skip if we've already shown this broadcast (arrived via poll + packet).
+    if (broadcastAt && state.breakoutLastBroadcastAt === broadcastAt) return;
+    state.breakoutLastBroadcastAt = broadcastAt;
+
+    const toast = document.createElement('div');
+    toast.className = 'breakout-broadcast-toast';
+    const strong = document.createElement('strong');
+    strong.textContent = 'Host:';
+    const span = document.createElement('span');
+    span.textContent = ' ' + message;
+    toast.appendChild(strong);
+    toast.appendChild(span);
+    document.body.appendChild(toast);
+    setTimeout(() => {
+      toast.classList.add('dismissing');
+      setTimeout(() => { if (toast.parentNode) toast.parentNode.removeChild(toast); }, 200);
+    }, 4000);
+  }
+
+  // ---- Session poll loop ----
+  function startBreakoutPollLoop() {
+    stopBreakoutPollLoop();
+    const run = () => {
+      const parent = state.breakoutParentRoom || breakoutsParentRoom();
+      if (!parent) return;
+      rpcGetSession(parent).then((session) => onBreakoutSessionTick(session)).catch(() => {});
+    };
+    run();
+    state.breakoutPollTimer = setInterval(run, BREAKOUT_POLL_INTERVAL_MS);
+  }
+
+  function stopBreakoutPollLoop() {
+    if (state.breakoutPollTimer) { clearInterval(state.breakoutPollTimer); state.breakoutPollTimer = null; }
+  }
+
+  async function breakoutFetchSession() {
+    const parent = breakoutsParentRoom();
+    if (!parent) return null;
+    try {
+      const session = await rpcGetSession(parent);
+      onBreakoutSessionTick(session);
+      return session;
+    } catch (e) {
+      console.warn('breakoutFetchSession threw:', e);
+      return null;
+    }
+  }
+
+  function onBreakoutSessionTick(session) {
+    // Session may be { session_id: null } or null when no active breakout.
+    const valid = session && session.session_id && session.status && session.status !== 'closed';
+
+    // Update host UI state
+    if (valid) {
+      const prevBroadcastAt = state.breakoutSession && state.breakoutSession.broadcast_at;
+      state.breakoutSession = session;
+      if (session.closes_at) state.breakoutClosesAt = session.closes_at;
+
+      // Broadcast from host: show toast if new broadcast_at appeared.
+      if (session.broadcast_at && session.broadcast_at !== prevBroadcastAt
+          && session.broadcast_message) {
+        showBreakoutBroadcastToast(session.broadcast_message, session.broadcast_at);
+      }
+
+      // Re-render host panel if open.
+      if (state.isHost && !$('breakout-panel').classList.contains('hidden')) {
+        renderBreakoutActiveView();
+      }
+    } else {
+      // Session closed or missing. If we're inside a breakout and haven't heard
+      // breakout_ended yet, treat this as the fallback closure signal.
+      if (state.inBreakout && state.breakoutClosesAt
+          && Date.now() > new Date(state.breakoutClosesAt).getTime() + 15000) {
+        handleBreakoutEnded({ main_room: state.breakoutParentRoom }).catch(() => {});
+      }
+      if (!state.inBreakout) {
+        state.breakoutSession = null;
+        // If host panel is open in create mode, no-op.
+      }
+    }
+  }
+
+  // ---- Participant actions ----
+  async function breakoutRequestHelp() {
+    if (state.breakoutHelpInflight) return;
+    if (!state.breakoutSession || !state.breakoutSession.session_id) return;
+    // Derive our current room id from the session's rooms list by room_name.
+    const myRoomName = (state.room && state.room.name) || (state.joinData && state.joinData.room_name);
+    const room = (state.breakoutSession.rooms || []).find((r) => r.room_name === myRoomName);
+    if (!room) {
+      console.warn('breakoutRequestHelp: room not found in session');
+      return;
+    }
+    state.breakoutHelpInflight = true;
+    const btn = $('btn-breakout-help');
+    if (btn) { btn.textContent = 'Sending...'; btn.disabled = true; }
+    try {
+      await rpcRequestHelp(state.breakoutSession.session_id, room.id);
+      // Light up the "Help requested ✓" confirmation for 10s.
+      if (btn) {
+        btn.textContent = 'Help requested ✓';
+        btn.classList.add('requested');
+        setTimeout(() => {
+          if (!btn) return;
+          btn.textContent = 'Request help';
+          btn.classList.remove('requested');
+          btn.disabled = false;
+          state.breakoutHelpInflight = false;
+        }, 10000);
+      } else {
+        state.breakoutHelpInflight = false;
+      }
+    } catch (e) {
+      console.warn('rpcRequestHelp failed:', e);
+      if (btn) { btn.textContent = 'Request help'; btn.disabled = false; }
+      state.breakoutHelpInflight = false;
+    }
+  }
+
+  async function breakoutLeaveEarly() {
+    // Participant opts out early — just return to the main room.
+    await handleBreakoutEnded({ main_room: state.breakoutParentRoom });
+  }
+
+  async function breakoutReturnToMain() {
+    // Host variant of leave-early when visiting a breakout.
+    await handleBreakoutEnded({ main_room: state.breakoutParentRoom });
+  }
+
+  // ---- Host: panel open/close ----
+  function breakoutPanelOpen() {
+    const panel = $('breakout-panel');
+    if (!panel) return;
+    panel.classList.remove('hidden');
+    resetBreakoutHelpBadge();
+    if (state.breakoutSession && state.breakoutSession.session_id) {
+      showBreakoutActiveView();
+    } else {
+      showBreakoutCreateView();
+    }
+  }
+  function breakoutPanelClose() {
+    const panel = $('breakout-panel');
+    if (panel) panel.classList.add('hidden');
+  }
+
+  function showBreakoutCreateView() {
+    $('breakout-create-view').classList.remove('hidden');
+    $('breakout-active-view').classList.add('hidden');
+    $('btn-breakout-create').classList.remove('hidden');
+    $('btn-breakout-end').classList.add('hidden');
+    $('breakout-panel-title').textContent = 'Create breakout rooms';
+    renderBreakoutCreateForm();
+  }
+
+  function showBreakoutActiveView() {
+    $('breakout-create-view').classList.add('hidden');
+    $('breakout-active-view').classList.remove('hidden');
+    $('btn-breakout-create').classList.add('hidden');
+    $('btn-breakout-end').classList.remove('hidden');
+    $('breakout-panel-title').textContent = 'Active breakout session';
+    renderBreakoutActiveView();
+  }
+
+  // ---- Host: create-form rendering + manual drag-drop ----
+  function breakoutParticipantList() {
+    // All remote + local participants currently connected.
+    if (!state.room) return [];
+    const all = [state.room.localParticipant, ...state.room.remoteParticipants.values()];
+    return all.map((p) => ({
+      identity: p.identity,
+      name: p.name || p.identity,
+      isLocal: p === state.room.localParticipant,
+    }));
+  }
+
+  function renderBreakoutCreateForm() {
+    const manual = document.querySelector('input[name="breakout-mode"]:checked');
+    const mode = manual ? manual.value : 'auto';
+    const manualBlock = $('breakout-manual-assign');
+    if (mode === 'manual') {
+      manualBlock.classList.remove('hidden');
+      renderBreakoutManualAssign();
+    } else {
+      manualBlock.classList.add('hidden');
+    }
+  }
+
+  function renderBreakoutManualAssign() {
+    const count = Math.max(2, Math.min(20, parseInt($('breakout-room-count').value, 10) || 3));
+    const grid = $('breakout-rooms-grid');
+    const unassigned = $('breakout-unassigned-row');
+    if (!grid || !unassigned) return;
+
+    // Preserve current assignments keyed by identity → roomIndex (0..count-1).
+    // Store on the DOM via data attributes of chips to keep renders cheap.
+    const prior = {};
+    document.querySelectorAll('.breakout-participant-chip').forEach((chip) => {
+      const id = chip.getAttribute('data-identity');
+      const roomId = chip.parentElement && chip.parentElement.getAttribute('data-room-id');
+      if (id && roomId) prior[id] = roomId;
+    });
+
+    // Rebuild room columns.
+    grid.innerHTML = '';
+    for (let i = 0; i < count; i++) {
+      const roomId = `room-${i}`;
+      const card = document.createElement('div');
+      card.className = 'breakout-room-card';
+      card.setAttribute('data-room-id', roomId);
+      const head = document.createElement('div');
+      head.className = 'breakout-room-card-header';
+      head.textContent = `Room ${i + 1}`;
+      const inner = document.createElement('div');
+      inner.className = 'breakout-room-card-participants';
+      inner.setAttribute('data-room-id', roomId);
+      card.appendChild(head);
+      card.appendChild(inner);
+      wireBreakoutDragTarget(inner);
+      grid.appendChild(card);
+    }
+
+    // Rebuild chips. Chips land where they were before (prior) or in unassigned.
+    unassigned.innerHTML = '';
+    wireBreakoutDragTarget(unassigned);
+
+    const participants = breakoutParticipantList();
+    participants.forEach((p) => {
+      const chip = document.createElement('div');
+      chip.className = 'breakout-participant-chip';
+      chip.setAttribute('draggable', 'true');
+      chip.setAttribute('data-identity', p.identity);
+      chip.textContent = p.name;
+      chip.addEventListener('dragstart', (e) => {
+        chip.classList.add('dragging');
+        try { e.dataTransfer.setData('text/plain', p.identity); } catch (_) { /* noop */ }
+      });
+      chip.addEventListener('dragend', () => chip.classList.remove('dragging'));
+
+      const targetRoom = prior[p.identity];
+      let targetEl = null;
+      if (targetRoom) {
+        targetEl = document.querySelector(`[data-room-id="${targetRoom}"]`);
+      }
+      if (!targetEl || targetEl === unassigned) {
+        unassigned.appendChild(chip);
+      } else {
+        // targetEl may be the outer card wrapping the participants list;
+        // prefer the inner list if so.
+        const inner = targetEl.classList.contains('breakout-room-card')
+          ? targetEl.querySelector('.breakout-room-card-participants')
+          : targetEl;
+        inner.appendChild(chip);
+      }
+    });
+  }
+
+  function wireBreakoutDragTarget(el) {
+    el.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      el.classList.add('drag-over');
+    });
+    el.addEventListener('dragleave', () => el.classList.remove('drag-over'));
+    el.addEventListener('drop', (e) => {
+      e.preventDefault();
+      el.classList.remove('drag-over');
+      let identity = '';
+      try { identity = e.dataTransfer.getData('text/plain'); } catch (_) { /* noop */ }
+      const chip = identity ? document.querySelector(`.breakout-participant-chip[data-identity="${CSS.escape(identity)}"]`) : null;
+      if (chip) el.appendChild(chip);
+    });
+  }
+
+  function collectManualAssignments() {
+    const assigns = [];
+    document.querySelectorAll('.breakout-rooms-grid .breakout-room-card').forEach((card, idx) => {
+      card.querySelectorAll('.breakout-participant-chip').forEach((chip) => {
+        assigns.push({
+          participant_identity: chip.getAttribute('data-identity'),
+          room_index: idx, // 0-based; server translates into room id
+        });
+      });
+    });
+    return assigns;
+  }
+
+  async function breakoutCreate() {
+    const errEl = $('breakout-create-error');
+    errEl.classList.add('hidden');
+
+    const roomCount = Math.max(2, Math.min(20, parseInt($('breakout-room-count').value, 10) || 3));
+    const durationMin = Math.max(1, Math.min(120, parseInt($('breakout-duration').value, 10) || 15));
+    const durationSec = durationMin * 60;
+    const modeEl = document.querySelector('input[name="breakout-mode"]:checked');
+    const mode = modeEl ? modeEl.value : 'auto';
+    const autoAssign = mode === 'auto';
+    const assignments = autoAssign ? null : collectManualAssignments();
+
+    const parent = breakoutsParentRoom();
+    if (!parent) {
+      errEl.textContent = 'Missing parent room.';
+      errEl.classList.remove('hidden');
+      return;
+    }
+
+    const btn = $('btn-breakout-create');
+    btn.disabled = true;
+    const origText = btn.textContent;
+    btn.textContent = 'Creating...';
+
+    try {
+      const resp = await rpcCreateBreakoutSession(parent, durationSec, roomCount, autoAssign, assignments);
+      // Expected shape: { session: {...}, rooms: [...], assignments: [{participant_identity, room_name, server_url, token, room_label, duration_seconds}, ...] }
+      if (!resp || resp.error) {
+        throw new Error((resp && resp.error) || 'create_breakout_session failed');
+      }
+      const session = resp.session || resp;
+      state.breakoutSession = session;
+      if (session.closes_at) state.breakoutClosesAt = session.closes_at;
+
+      // Fan out per-assignment DataPackets so only the targeted participant
+      // receives their breakout token. LiveKit web SDK 2.9.1:
+      //   localParticipant.publishData(payload, { reliable, destinationIdentities, topic })
+      const perAssign = resp.assignments || session.assignments || [];
+      const serverUrl = (state.joinData && state.joinData.server_url) || null;
+      for (const a of perAssign) {
+        if (!a || !a.participant_identity || !a.token) continue;
+        if (a.participant_identity === breakoutsLocalIdentity()) {
+          // Host isn't auto-moved. Skip.
+          continue;
+        }
+        const payload = {
+          type: 'breakout_assign',
+          server_url: a.server_url || serverUrl,
+          token: a.token,
+          room_name: a.room_name,
+          room_label: a.room_label || a.room_name,
+          duration_seconds: durationSec,
+          closes_at: session.closes_at || null,
+        };
+        try {
+          const buf = new TextEncoder().encode(JSON.stringify(payload));
+          await state.room.localParticipant.publishData(buf, {
+            reliable: true,
+            destinationIdentities: [a.participant_identity],
+          });
+        } catch (e) {
+          console.warn('breakout_assign publishData failed for', a.participant_identity, e);
+        }
+      }
+
+      // Start host-side polling so we see help requests + broadcasts live.
+      startBreakoutPollLoop();
+      startBreakoutTimerTick();
+      showBreakoutActiveView();
+    } catch (e) {
+      console.error('breakoutCreate failed:', e);
+      errEl.textContent = 'Failed to create session.';
+      errEl.classList.remove('hidden');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = origText;
+    }
+  }
+
+  async function breakoutEndNow() {
+    if (!state.breakoutSession || !state.breakoutSession.session_id) return;
+    const btn = $('btn-breakout-end');
+    btn.disabled = true;
+    try {
+      await rpcEndSession(state.breakoutSession.session_id);
+      // Worker will fanout breakout_ended to every breakout room. Host is in
+      // the main room, so we just tear down UI.
+      state.breakoutSession = null;
+      state.breakoutClosesAt = null;
+      stopBreakoutPollLoop();
+      stopBreakoutTimerTick();
+      breakoutPanelClose();
+    } catch (e) {
+      console.error('breakoutEndNow failed:', e);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function breakoutBroadcast() {
+    const input = $('breakout-broadcast-input');
+    const message = (input.value || '').trim();
+    if (!message) return;
+    if (!state.breakoutSession || !state.breakoutSession.session_id) return;
+    const btn = $('btn-breakout-broadcast');
+    btn.disabled = true;
+    try {
+      await rpcBroadcast(state.breakoutSession.session_id, message);
+      input.value = '';
+      // Poll will pick up the broadcast_message + broadcast_at and render a
+      // toast on every client within ~5s. We don't fan out a DataPacket here
+      // because the host is only connected to the main room.
+    } catch (e) {
+      console.error('breakoutBroadcast failed:', e);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function breakoutVisitRoom(roomId) {
+    if (!state.breakoutSession || !state.breakoutSession.session_id) return;
+    try {
+      const resp = await rpcJoinBreakoutRoom(state.breakoutSession.session_id, roomId, breakoutsLocalIdentity());
+      if (!resp || resp.error) throw new Error((resp && resp.error) || 'join_breakout_room failed');
+      state.breakoutParentRoom = (state.joinData && state.joinData.room_name) || state.breakoutParentRoom;
+      state.breakoutRoomLabel = resp.room_label || resp.room_name || 'Breakout';
+      await switchRoom({
+        serverUrl: resp.server_url || (state.joinData && state.joinData.server_url),
+        token: resp.token,
+        newRoomName: resp.room_name,
+        reason: 'host_visit_breakout',
+      });
+      state.inBreakout = true;
+      showHostVisitBanner();
+      showBreakoutBanner();
+      startBreakoutTimerTick();
+      breakoutPanelClose();
+    } catch (e) {
+      console.error('breakoutVisitRoom failed:', e);
+    }
+  }
+
+  async function breakoutGoToHelpRoom(helpRequest) {
+    await breakoutVisitRoom(helpRequest.room_id);
+  }
+
+  async function breakoutResolveHelp(helpId) {
+    try {
+      await rpcResolveHelp(helpId);
+      // Refresh session immediately so the request disappears from the list.
+      await breakoutFetchSession();
+    } catch (e) {
+      console.error('breakoutResolveHelp failed:', e);
+    }
+  }
+
+  // ---- Host: active-view rendering ----
+  function renderBreakoutActiveView() {
+    const session = state.breakoutSession;
+    if (!session) return;
+
+    // Timer already ticks independently; just set initial value.
+    const pt = $('breakout-panel-timer');
+    if (pt) pt.textContent = breakoutTimerString();
+
+    // Help requests
+    const helpWrap = $('breakout-help-requests');
+    if (helpWrap) {
+      helpWrap.innerHTML = '';
+      const unresolved = (session.help_requests || []).filter((h) => !h.resolved_at);
+      if (unresolved.length > 0) bumpBreakoutHelpBadge();
+      unresolved.forEach((h) => {
+        const card = document.createElement('div');
+        card.className = 'breakout-help-request-card';
+        const text = document.createElement('span');
+        text.textContent = `${h.requester_name || h.requester_identity || 'Someone'} needs help`;
+        const actions = document.createElement('div');
+        actions.className = 'breakout-help-request-actions';
+        const goBtn = document.createElement('button');
+        goBtn.type = 'button';
+        goBtn.textContent = 'Go to room';
+        goBtn.addEventListener('click', () => breakoutGoToHelpRoom(h));
+        const resBtn = document.createElement('button');
+        resBtn.type = 'button';
+        resBtn.textContent = 'Resolve';
+        resBtn.addEventListener('click', () => breakoutResolveHelp(h.id));
+        actions.appendChild(goBtn);
+        actions.appendChild(resBtn);
+        card.appendChild(text);
+        card.appendChild(actions);
+        helpWrap.appendChild(card);
+      });
+    }
+
+    // Room grid
+    const grid = $('breakout-active-rooms-grid');
+    if (grid) {
+      grid.innerHTML = '';
+      (session.rooms || []).forEach((r, idx) => {
+        const card = document.createElement('div');
+        card.className = 'breakout-active-room';
+        const head = document.createElement('div');
+        head.className = 'breakout-active-room-head';
+        const title = document.createElement('span');
+        title.className = 'breakout-active-room-title';
+        title.textContent = r.room_label || `Room ${idx + 1}`;
+        const count = document.createElement('span');
+        count.className = 'breakout-active-room-count';
+        const parts = r.participants || [];
+        count.textContent = `${parts.length} participant${parts.length === 1 ? '' : 's'}`;
+        head.appendChild(title);
+        head.appendChild(count);
+
+        const body = document.createElement('div');
+        body.className = 'breakout-active-room-participants';
+        body.textContent = parts.map((p) => p.name || p.identity).join(', ') || '—';
+
+        const footer = document.createElement('div');
+        footer.className = 'breakout-active-room-footer';
+        const hasHelp = (session.help_requests || []).some((h) => !h.resolved_at && h.room_id === r.id);
+        if (hasHelp) {
+          const badge = document.createElement('span');
+          badge.className = 'breakout-help-badge';
+          badge.textContent = '!';
+          footer.appendChild(badge);
+        } else {
+          footer.appendChild(document.createElement('span'));
+        }
+        const visitBtn = document.createElement('button');
+        visitBtn.className = 'breakout-visit-btn';
+        visitBtn.textContent = 'Visit';
+        visitBtn.addEventListener('click', () => breakoutVisitRoom(r.id));
+        footer.appendChild(visitBtn);
+
+        card.appendChild(head);
+        card.appendChild(body);
+        card.appendChild(footer);
+        grid.appendChild(card);
+      });
+    }
+  }
+
+  function setupBreakoutControls() {
+    const btn = $('btn-breakouts');
+    if (btn) btn.addEventListener('click', breakoutPanelOpen);
+
+    const close = $('btn-close-breakout');
+    if (close) close.addEventListener('click', breakoutPanelClose);
+    const cancel = $('btn-breakout-cancel');
+    if (cancel) cancel.addEventListener('click', breakoutPanelClose);
+
+    const create = $('btn-breakout-create');
+    if (create) create.addEventListener('click', breakoutCreate);
+    const end = $('btn-breakout-end');
+    if (end) end.addEventListener('click', breakoutEndNow);
+
+    // Create-form dynamic bits
+    const roomCount = $('breakout-room-count');
+    if (roomCount) roomCount.addEventListener('input', () => {
+      const modeEl = document.querySelector('input[name="breakout-mode"]:checked');
+      if (modeEl && modeEl.value === 'manual') renderBreakoutManualAssign();
+    });
+    document.querySelectorAll('input[name="breakout-mode"]').forEach((r) => {
+      r.addEventListener('change', renderBreakoutCreateForm);
+    });
+
+    // Broadcast
+    const bcInput = $('breakout-broadcast-input');
+    const bcBtn = $('btn-breakout-broadcast');
+    if (bcInput && bcBtn) {
+      bcInput.addEventListener('input', () => {
+        bcBtn.disabled = !bcInput.value.trim();
+      });
+      bcBtn.addEventListener('click', breakoutBroadcast);
+    }
+
+    // Backdrop dismiss
+    const backdrop = document.querySelector('.breakout-panel-backdrop');
+    if (backdrop) backdrop.addEventListener('click', breakoutPanelClose);
+
+    // Participant banner buttons
+    const helpBtn = $('btn-breakout-help');
+    if (helpBtn) helpBtn.addEventListener('click', breakoutRequestHelp);
+    const leaveBtn = $('btn-breakout-leave');
+    if (leaveBtn) leaveBtn.addEventListener('click', breakoutLeaveEarly);
+    const returnBtn = $('btn-breakout-return-main');
+    if (returnBtn) returnBtn.addEventListener('click', breakoutReturnToMain);
+
+    // Assign-overlay cancel (re-bound per-assign too, but safe to wire once).
+    const assignCancel = $('btn-breakout-assign-cancel');
+    if (assignCancel) assignCancel.addEventListener('click', () => {
+      $('breakout-assign-overlay').classList.add('hidden');
+      if (state.breakoutAssignTimer) { clearTimeout(state.breakoutAssignTimer); state.breakoutAssignTimer = null; }
+    });
   }
 
   // ------------------------------------
@@ -2131,6 +3043,12 @@
       setupJoinCodeForm();
       return;
     }
+
+    // Dev-only: ?forceHost=1 lights up the host-only controls for testing.
+    try {
+      const qp = new URLSearchParams(window.location.search);
+      if (qp.get('forceHost') === '1') state.isHost = true;
+    } catch (_) { /* noop */ }
 
     state.token = path;
     setupCallControls();
