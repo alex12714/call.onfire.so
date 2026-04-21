@@ -1636,6 +1636,37 @@
       }
     }
 
+    // onfiremobile-wy8hm: echo-before-send race. If Centrifugo (or the poll)
+    // delivers the server row BEFORE the send_* RPC's optimisticReplaces key
+    // was stamped onto our optimistic row, the block above misses and we'd
+    // end up with both the optimistic and authoritative rows on screen.
+    // Fallback dedup: a self-message with the same text arriving within 10s
+    // of an unresolved optimistic row is almost certainly the echo — splice
+    // the optimistic row out first, then let the authoritative one render.
+    if (normalized.isSelf && normalized.text) {
+      const windowMs = 10000;
+      const incomingTs = normalized.timestamp
+        ? new Date(normalized.timestamp).getTime()
+        : Date.now();
+      for (let i = chatMessages.length - 1; i >= 0; i--) {
+        const existing = chatMessages[i];
+        if (!existing.optimisticKey) continue;
+        if (existing.text !== normalized.text) continue;
+        const existingTs = existing.timestamp
+          ? new Date(existing.timestamp).getTime()
+          : 0;
+        if (Math.abs(incomingTs - existingTs) > windowMs) continue;
+        // Found the unresolved optimistic row — replace it so the echo
+        // doesn't double-render. Matches the same contract as the
+        // optimisticReplaces branch above.
+        chatMessages[i] = { ...normalized };
+        state.chatSeenMessageIds.add(normalized.id);
+        chatRenderMessages();
+        if (chatPanelOpen) chatScrollToBottom();
+        return;
+      }
+    }
+
     if (state.chatSeenMessageIds.has(normalized.id)) return;
     state.chatSeenMessageIds.add(normalized.id);
 
