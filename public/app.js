@@ -17,9 +17,10 @@
   // ------------------------------------
   let state = {
     token: null,           // URL path token
-    hostToken: null,       // ?host=<token> query param — host credentials minted at create_call_link
+    hostToken: null,       // ?host=<token> query param — host credentials
+    isHost: false,         // True iff host-token join succeeded
     callLink: null,        // Data from get_call_link
-    joinData: null,        // Data from join_call_as_guest / join_call_as_host
+    joinData: null,        // Data from join_call_as_guest
     room: null,            // LiveKit Room instance
     localVideoTrack: null,
     localAudioTrack: null,
@@ -34,38 +35,33 @@
     remoteScreenShareTrack: null,
     remoteScreenShareParticipant: null,
     pollTimer: null,       // Polling timer for start-meeting flow
-    hasSeenInitialRoster: false, // true ~2s after Connected; suppresses join chime for pre-existing participants
-    isHandRaised: false,   // Local raise-hand UI state; mirrors localParticipant.attributes.handRaised
-    isHost: false,         // True when ?forceHost=1 is set or joinData.is_host — gates breakout host UI
-    guestName: null,       // Cached guest name so we can re-join main room on breakout_ended
-    breakoutSession: null, // Active breakout session (host-side) or attached state (participant)
-    inBreakout: false,     // True while participant is inside a breakout room
-    breakoutParentRoom: null, // Main room name (parent) when inside a breakout
-    breakoutClosesAt: null,   // ISO string / ms timestamp for client-side countdown
-    breakoutRoomLabel: null,  // Friendly "Room N" label for banner
-    breakoutLastBroadcastAt: null, // Last-seen broadcast_at to dedupe toasts
-    breakoutPollTimer: null,  // setInterval for get_breakout_session poll
-    breakoutTimerTick: null,  // setInterval for UI countdown ticking
-    breakoutAssignTimer: null, // setTimeout for the 3-second pre-switch takeover
-    breakoutHelpInflight: false,
+    waitingPollTimer: null,
 
-    // ---- Unified chat (onfiremobile-nx2a3) ----
-    // When state.chatUnifiedEnabled && state.callChat.enabled, chat is routed
-    // through the PostgREST RPCs + Centrifugo (or polling fallback) instead of
-    // LiveKit DataPackets. See handleJoin / initUnifiedChat.
-    chatUnifiedEnabled: false,         // system_config.call_chat_unified value
-    callChat: { conversationId: null, topicId: null, enabled: false },
-    centrifuge: null,                  // Centrifuge client instance
-    centrifugeSubscription: null,      // Subscription for the conversation channel
-    chatPollTimer: null,               // setInterval fallback when Centrifugo is unavailable
-    chatLastSeenTimestamp: null,       // ISO string; cursor for list_call_chat polling
-    chatSeenMessageIds: null,          // Set<string> — dedup Centrifugo echoes vs optimistic renders
-    chatUnifiedActive: false,          // True once initUnifiedChat() has run for this call
+    // -- Breakouts -----------------------------------------------------------
+    // Identity used when calling breakout RPCs. For guests, populated from
+    // room.localParticipant.identity after connect (`guest-<hex>`). For hosts
+    // on the web client, populated from joinData.creator_identity (UUID).
+    myIdentity: null,
+    creatorIdentity: null,       // joinData.creator_identity (used for host RPC calls)
+    parentRoomName: null,        // joinData.room_name — needed for return-to-main
+
+    // Current state
+    currentBreakout: null,       // { sessionId, roomId, roomName, roomLabel, closesAt }
+    isSwitchingRoom: false,      // re-entrancy guard
+    kickedToMainReason: null,    // 'timer_expired' | 'host_ended' (for toast)
+
+    // Session poll (participant polls while in breakout; host polls while panel is open or session active)
+    breakoutSession: null,       // full state from get_breakout_session
+    breakoutPollTimer: null,
+    breakoutCountdownTimer: null,
+    lastBroadcastAt: null,       // dedupe broadcast toasts
+    helpRequestPendingUntil: 0,  // timestamp: participant help button cooldown
+    hostPanelOpen: false,
+
+    // Guest-only: remember the name used so we can re-mint a main-room token
+    // after a breakout ends (new identity, same name).
+    lastGuestName: null,
   };
-
-  // Toast queue for "X raised their hand" notifications.
-  const _raiseHandToastQueue = [];
-  let _raiseHandToastActive = false;
 
   // ------------------------------------
   // DOM References
@@ -79,6 +75,7 @@
     startMeeting: $('screen-start-meeting'),
     meetingReady: $('screen-meeting-ready'),
     join: $('screen-join'),
+    waiting: $('screen-waiting'),
     call: $('screen-call'),
     ended: $('screen-ended'),
   };
@@ -157,10 +154,6 @@
     });
   }
 
-  // ---- Host-scoped join via ?host=<host_token> ------------------------------
-  // When the URL carries ?host=<token>, the caller holds creator credentials
-  // minted by the backend at create_call_link time. joinCallAsHost /
-  // endCallLinkAsHost enforce the host_token server-side (see call_links.host_token).
   async function joinCallAsHost(linkToken, hostToken) {
     return apiCall('join_call_as_host', {
       p_link_token: linkToken,
@@ -173,66 +166,6 @@
       p_link_token: linkToken,
       p_host_token: hostToken,
     });
-  }
-
-  // ---- Unified chat RPCs (onfiremobile-nx2a3) ------------------------------
-  async function sendCallChatMessage(linkToken, guestName, text) {
-    return apiCall('send_call_chat_message', {
-      p_link_token: linkToken,
-      p_guest_name: guestName || 'Guest',
-      p_text: text,
-    });
-  }
-
-  async function sendCallChatFile(linkToken, guestName, fileName, mime, r2Key, sizeBytes) {
-    return apiCall('send_call_chat_file', {
-      p_link_token: linkToken,
-      p_guest_name: guestName || 'Guest',
-      p_file_name: fileName,
-      p_mime: mime,
-      p_r2_key: r2Key,
-      p_size_bytes: sizeBytes,
-    });
-  }
-
-  async function listCallChat(linkToken, sinceIso) {
-    return apiCall('list_call_chat', {
-      p_link_token: linkToken,
-      p_since: sinceIso || null,
-    });
-  }
-
-  async function generateGuestChatUploadUrl(linkToken, fileName, mime, sizeBytes) {
-    return apiCall('generate_guest_chat_upload_url', {
-      p_link_token: linkToken,
-      p_file_name: fileName,
-      p_mime: mime,
-      p_size_bytes: sizeBytes,
-    });
-  }
-
-  async function generateGuestCentrifugoToken(linkToken) {
-    return apiCall('generate_guest_centrifugo_token', {
-      p_link_token: linkToken,
-    });
-  }
-
-  // Read the call_chat_unified feature flag from system_config. web_anon is
-  // permitted to read this key via the anon_read_public_config RLS policy.
-  // Returns true iff the value is exactly 'true' (string). Any error → false.
-  async function fetchCallChatUnifiedFlag() {
-    try {
-      const resp = await fetch(`${API_BASE}/system_config?key=eq.call_chat_unified&select=value`, {
-        headers: { 'Accept': 'application/json' },
-      });
-      if (!resp.ok) return false;
-      const rows = await resp.json();
-      if (!Array.isArray(rows) || rows.length === 0) return false;
-      return String(rows[0].value).toLowerCase() === 'true';
-    } catch (e) {
-      console.debug('fetchCallChatUnifiedFlag failed:', e && e.message);
-      return false;
-    }
   }
 
   // ------------------------------------
@@ -476,20 +409,7 @@
     btnSpinner.classList.remove('hidden');
 
     try {
-      // Host path: when ?host=<token> is present, authenticate via the
-      // host_token and inherit creator privileges. Fall back to guest-join on
-      // any error so a stale host link doesn't lock the user out.
-      let data;
-      if (state.hostToken) {
-        data = await joinCallAsHost(state.token, state.hostToken);
-        if (data && data.error) {
-          console.warn('host join failed, falling back to guest:', data.error);
-          state.hostToken = null;
-          data = await joinCallAsGuest(state.token, guestName);
-        }
-      } else {
-        data = await joinCallAsGuest(state.token, guestName);
-      }
+      const data = await joinCallAsGuest(state.token, guestName);
 
       if (data.error) {
         showError('Cannot Join', data.error);
@@ -497,25 +417,12 @@
       }
 
       state.joinData = data;
-      state.guestName = guestName;
-      // Honor server-side is_host; fall back to forceHost dev shortcut (read in init()).
-      if (data && data.is_host) state.isHost = true;
 
-      // Capture the unified-chat context (conversation + topic). Both must be
-      // non-null for the new chat path; older link rows may not have them.
-      const convId  = data && (data.conversation_id || data.conversationId);
-      const topicId = data && (data.topic_id || data.topicId);
-      state.callChat = {
-        conversationId: convId || null,
-        topicId: topicId || null,
-        enabled: !!(convId && topicId),
-      };
-
-      // Read the server-side feature flag. Don't block join on failure — default off.
-      try {
-        state.chatUnifiedEnabled = await fetchCallChatUnifiedFlag();
-      } catch (_) {
-        state.chatUnifiedEnabled = false;
+      // Check if placed in waiting room
+      if (data.admission_status === 'waiting') {
+        stopVideoPreview();
+        showWaitingScreen($('guest-name').value.trim());
+        return;
       }
 
       stopVideoPreview();
@@ -535,12 +442,11 @@
   async function startCall(joinData) {
     showScreen('call');
 
-    // Prefer the modern .call-layout; fall back to .call-container or the screen-call container.
-    const callContainer = document.querySelector('#screen-call .call-layout') || document.querySelector('.call-container') || document.getElementById('screen-call');
+    const callContainer = document.querySelector('.call-container');
     const overlay = document.createElement('div');
     overlay.className = 'connecting-overlay';
     overlay.innerHTML = '<div class="spinner"></div><p>Connecting to call...</p>';
-    if (callContainer) callContainer.appendChild(overlay);
+    callContainer.appendChild(overlay);
 
     try {
       const LivekitClient = window.LivekitClient;
@@ -557,17 +463,9 @@
       });
 
       state.room = room;
-      state.hasSeenInitialRoster = false;
       setupRoomEvents(room);
 
       await room.connect(joinData.server_url, joinData.token);
-
-      // Unblock remote audio playback while the join-click user-gesture chain is
-      // still fresh. Browsers otherwise suppress the hidden <audio> elements the
-      // LiveKit SDK auto-attaches — the AudioPlaybackStatusChanged handler below
-      // surfaces a tap-to-enable overlay if the browser still blocks it.
-      try { await room.startAudio(); } catch (_) { /* handled below */ }
-      if (!room.canPlaybackAudio) showEnableAudioPrompt(room);
 
       const isVideo = joinData.call_type === 'video';
 
@@ -579,7 +477,18 @@
       state.isMicMuted = state.isPreviewMicOff;
       state.isVideoOff = isVideo ? state.isPreviewCameraOff : true;
 
+      // Cache identity + parent room for breakouts (identity is stable for
+      // the whole meeting — tokens may change but the LiveKit participant
+      // identity is baked into them by generate_livekit_token).
+      state.myIdentity = room.localParticipant.identity || null;
+      state.creatorIdentity = joinData.creator_identity || null;
+      // room_name may be absent on legacy call-links; fall back to the slug.
+      if (!state.parentRoomName) {
+        state.parentRoomName = joinData.room_name || state.token;
+      }
+
       updateControlButtons();
+      updateBreakoutButtonVisibility();
 
       if (!isVideo) {
         $('btn-video').style.display = 'none';
@@ -599,17 +508,12 @@
 
       renderParticipants();
 
-      // Late-joiner catchup: pull any active polls for this room.
-      pollListActive().catch((e) => console.warn('pollListActive failed on join:', e));
-
-      // Breakouts: reveal the host-only button (if this is a host) and pull any
-      // active breakout session so a host that rejoins sees existing state.
-      breakoutsOnCallJoined();
-
-      // Unified chat (onfiremobile-nx2a3): if enabled + link is topic-backed,
-      // backfill history and attach to Centrifugo (or polling fallback). Chat
-      // sends now route through the PostgREST RPCs instead of DataPackets.
-      initUnifiedChat().catch((e) => console.warn('initUnifiedChat failed:', e && e.message));
+      // Rehydrate: if this user refreshed the page while in an active
+      // breakout, the backend still has their assignment. Skip for guests
+      // (identity changes on every join) but reconnect hosts into their
+      // assigned breakout room if one exists.
+      maybeRehydrateBreakoutAssignment().catch((e) =>
+        console.debug('rehydrate:', e && e.message));
 
     } catch (err) {
       console.error('Call start error:', err);
@@ -621,47 +525,12 @@
   function setupRoomEvents(room) {
     const LivekitClient = window.LivekitClient;
 
-    room.on(LivekitClient.RoomEvent.Connected, () => {
-      // Participants already in the room at connect time fire ParticipantConnected
-      // during the initial roster. Suppress chimes for those and only start playing
-      // them ~2s after Connected.
-      setTimeout(() => { state.hasSeenInitialRoster = true; }, 2000);
-    });
-
-    room.on(LivekitClient.RoomEvent.ParticipantConnected, (participant) => {
-      if (
-        state.hasSeenInitialRoster &&
-        room.localParticipant &&
-        participant.identity !== room.localParticipant.identity
-      ) {
-        playChime('/sounds/join.ogg');
-      }
-      renderParticipants();
-    });
-
-    room.on(LivekitClient.RoomEvent.ParticipantDisconnected, (participant) => {
-      if (
-        state.hasSeenInitialRoster &&
-        room.localParticipant &&
-        participant.identity !== room.localParticipant.identity
-      ) {
-        playChime('/sounds/leave.ogg');
-      }
-      renderParticipants();
-    });
+    room.on(LivekitClient.RoomEvent.ParticipantConnected, () => renderParticipants());
+    room.on(LivekitClient.RoomEvent.ParticipantDisconnected, () => renderParticipants());
 
     room.on(LivekitClient.RoomEvent.TrackSubscribed, (track, publication, participant) => {
       if (track.source === LivekitClient.Track.Source.ScreenShare) {
         showScreenShareView(track, participant);
-      }
-      // Explicitly attach remote audio tracks to a hidden <audio> element in the DOM.
-      // LiveKit auto-attaches by default, but keeping an explicit reference guarantees
-      // playback survives DOM re-renders from renderParticipants().
-      if (track.kind === LivekitClient.Track.Kind.Audio) {
-        const el = track.attach();
-        el.setAttribute('data-onfire-remote-audio', participant.identity || '');
-        el.style.display = 'none';
-        document.body.appendChild(el);
       }
       renderParticipants();
     });
@@ -670,18 +539,7 @@
       if (track.source === LivekitClient.Track.Source.ScreenShare) {
         hideScreenShareView();
       }
-      if (track && track.kind === LivekitClient.Track.Kind.Audio) {
-        track.detach().forEach((el) => el.remove());
-      }
       renderParticipants();
-    });
-
-    room.on(LivekitClient.RoomEvent.AudioPlaybackStatusChanged, () => {
-      if (room.canPlaybackAudio) {
-        hideEnableAudioPrompt();
-      } else {
-        showEnableAudioPrompt(room);
-      }
     });
 
     room.on(LivekitClient.RoomEvent.TrackMuted, () => renderParticipants());
@@ -718,61 +576,34 @@
       $('call-status').classList.add('connected');
     });
 
-    // Data channel messages for chat + raise-hand signalling
+    // Data channel messages for chat
     room.on(LivekitClient.RoomEvent.DataReceived, (payload, participant) => {
       try {
         const text = new TextDecoder().decode(payload);
         const msg = JSON.parse(text);
         if (msg.type === 'chat_message' || msg.type === 'chat_file') {
-          // When the unified chat path is active, drop any legacy DataPacket
-          // chat traffic so authed + guest messages don't double-render
-          // (the unified path already carries them via Centrifugo/poll).
-          if (state.chatUnifiedActive) return;
           chatAddIncoming(msg, participant);
-        } else if (msg.type === 'lower_all_hands') {
-          // A host asked everyone to lower their hand. Best-effort: clear our own
-          // attribute if we have it raised. Other clients enforce the same.
-          if (state.isHandRaised) {
-            lowerLocalHand().catch((e) => console.warn('lowerLocalHand failed:', e));
+        } else if (msg.type === 'room_ended') {
+          // Host told everyone to disconnect. Show the end screen with the
+          // host's reason (if provided) and bail.
+          state.kickedByHost = true;
+          if (state.room) {
+            try { state.room.disconnect(); } catch (e) {}
           }
-        } else if (msg.type === 'poll_new' || msg.type === 'poll_vote_update' || msg.type === 'poll_closed') {
-          pollHandleDataPacket(msg);
+          // endCall() will fire via RoomEvent.Disconnected below; we also
+          // call it here in case disconnect() was a no-op.
+          endCall({ endedByHost: true });
         } else if (msg.type === 'breakout_assign') {
-          // Host split us into a breakout room. Server embeds the new token
-          // in the packet. Show a 3-second takeover then switch.
-          handleBreakoutAssign(msg).catch((e) => console.warn('handleBreakoutAssign failed:', e));
+          // Host pushed us into a breakout. Packet carries the token so no
+          // extra round-trip before reconnect.
+          handleBreakoutAssignPacket(msg);
         } else if (msg.type === 'breakout_ended') {
-          // Timer worker (or host) ended the breakout. The worker only sends
-          // `{type, main_room}` — no new token. We must mint one client-side
-          // by calling joinCallAsGuest with the cached guestName.
-          handleBreakoutEnded(msg).catch((e) => console.warn('handleBreakoutEnded failed:', e));
-        } else if (msg.type === 'breakout_broadcast') {
-          // In-call announcement from the host. Deduped against the poll.
-          showBreakoutBroadcastToast(msg.message || '', msg.broadcast_at || null);
-        } else if (msg.type === 'breakout_help_requested') {
-          // Host-only signal. Our help-requests list refreshes via poll; this
-          // is just the badge nudge so the host sees something immediately.
-          if (state.isHost) bumpBreakoutHelpBadge();
+          // Worker or host ended the session. Return to main room.
+          handleBreakoutEndedPacket(msg);
         }
       } catch (e) {
         // Ignore non-chat data
       }
-    });
-
-    // Raise-hand attribute changes from any participant (remote or local).
-    // `changed` is a Record<string,string> delta of only the keys that changed.
-    room.on(LivekitClient.RoomEvent.ParticipantAttributesChanged, (changed, participant) => {
-      if (!changed || typeof changed !== 'object') return;
-      if (Object.prototype.hasOwnProperty.call(changed, 'handRaised')) {
-        const newVal = changed.handRaised;
-        const isRemote = participant && participant !== room.localParticipant;
-        // Transition from falsy → timestamp triggers a toast (remote only).
-        if (isRemote && newVal && String(newVal).length > 0) {
-          enqueueRaiseHandToast(participant.name || participant.identity || 'Someone');
-        }
-      }
-      // Re-render so the badge on the tile updates immediately.
-      renderParticipants();
     });
   }
 
@@ -794,9 +625,6 @@
       const tile = createParticipantTile(participant);
       grid.appendChild(tile);
     });
-
-    // Host-only "lower all hands" button visibility depends on whether any hand is up.
-    updateLowerAllHandsButton();
   }
 
   function createParticipantTile(participant) {
@@ -846,17 +674,6 @@
     nameEl.appendChild(micIndicator);
     nameEl.appendChild(nameText);
     tile.appendChild(nameEl);
-
-    // Raised-hand badge — read from LiveKit attributes. Timestamp string (non-empty) = raised.
-    const attrs = (participant && participant.attributes) || {};
-    const handVal = attrs.handRaised;
-    if (handVal && String(handVal).length > 0) {
-      const badge = document.createElement('div');
-      badge.className = 'raised-hand-badge';
-      badge.title = 'Hand raised';
-      badge.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 11V6a2 2 0 0 0-2-2v0a2 2 0 0 0-2 2v0"/><path d="M14 10V4a2 2 0 0 0-2-2v0a2 2 0 0 0-2 2v2"/><path d="M10 10.5V6a2 2 0 0 0-2-2v0a2 2 0 0 0-2 2v8"/><path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15"/></svg>';
-      tile.appendChild(badge);
-    }
 
     return tile;
   }
@@ -940,164 +757,6 @@
     $('participants-grid').classList.remove('strip-mode');
   }
 
-  // ------------------------------------
-  // Audio Playback Unblock Prompt
-  // ------------------------------------
-  // Browsers block remote audio autoplay unless a user gesture is close in time.
-  // The gesture from the "Join Call" click is often lost across the async
-  // connect/token chain. Surface a tappable overlay that calls room.startAudio()
-  // on click to unblock.
-  function showEnableAudioPrompt(room) {
-    if (document.getElementById('enable-audio-prompt')) return;
-    const prompt = document.createElement('button');
-    prompt.id = 'enable-audio-prompt';
-    prompt.className = 'enable-audio-prompt';
-    prompt.type = 'button';
-    prompt.innerHTML = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg><span>Tap to enable audio</span>';
-    prompt.addEventListener('click', async () => {
-      try { await room.startAudio(); } catch (e) { console.warn('startAudio failed:', e); }
-      if (room.canPlaybackAudio) hideEnableAudioPrompt();
-    });
-    document.body.appendChild(prompt);
-  }
-
-  function hideEnableAudioPrompt() {
-    const prompt = document.getElementById('enable-audio-prompt');
-    if (prompt) prompt.remove();
-  }
-
-  // ------------------------------------
-  // Join / Leave Chimes
-  // ------------------------------------
-  function playChime(src) {
-    try {
-      const a = new Audio(src);
-      a.volume = 0.4;
-      // autoplay may be blocked; swallow the rejection silently — chimes are non-critical
-      a.play().catch(() => {});
-    } catch (_) {
-      // Ignore Audio constructor failures on exotic browsers
-    }
-  }
-
-  // ------------------------------------
-  // Raise Hand
-  // ------------------------------------
-  async function raiseLocalHand() {
-    if (!state.room || !state.room.localParticipant) return;
-    await state.room.localParticipant.setAttributes({ handRaised: String(Date.now()) });
-    state.isHandRaised = true;
-    updateRaiseHandButton();
-    renderParticipants();
-  }
-
-  async function lowerLocalHand() {
-    if (!state.room || !state.room.localParticipant) return;
-    // Empty string clears the key without colliding with other attributes.
-    await state.room.localParticipant.setAttributes({ handRaised: '' });
-    state.isHandRaised = false;
-    updateRaiseHandButton();
-    renderParticipants();
-  }
-
-  async function toggleRaiseHand() {
-    try {
-      if (state.isHandRaised) await lowerLocalHand();
-      else await raiseLocalHand();
-    } catch (e) {
-      console.error('toggleRaiseHand failed:', e);
-    }
-  }
-
-  function updateRaiseHandButton() {
-    const btn = $('btn-raise-hand');
-    if (btn) btn.classList.toggle('active', state.isHandRaised);
-    updateLowerAllHandsButton();
-  }
-
-  // The web client is currently guest-only, so joinData.is_host is always false.
-  // Kept here so the UI lights up automatically the day hosts can join via web.
-  function updateLowerAllHandsButton() {
-    const btn = $('btn-lower-all-hands');
-    if (!btn) return;
-    const isHost = !!(state.joinData && state.joinData.is_host);
-    const anyHandRaised = hasAnyRaisedHand();
-    const visible = isHost && anyHandRaised;
-    btn.classList.toggle('hidden', !visible);
-  }
-
-  function hasAnyRaisedHand() {
-    if (!state.room) return false;
-    const all = [state.room.localParticipant, ...state.room.remoteParticipants.values()];
-    return all.some((p) => {
-      const v = p && p.attributes && p.attributes.handRaised;
-      return v && String(v).length > 0;
-    });
-  }
-
-  async function lowerAllHands() {
-    if (!state.room) return;
-    // Client-only best-effort: broadcast a DataPacket; every client clears its own
-    // hand when it receives lower_all_hands. There is no server-side API to clear
-    // another participant's attributes on the web SDK, so this is advisory only.
-    try {
-      const data = new TextEncoder().encode(JSON.stringify({ type: 'lower_all_hands' }));
-      await state.room.localParticipant.publishData(data, { reliable: true });
-      // Clear our own hand if raised.
-      if (state.isHandRaised) await lowerLocalHand();
-      showSimpleToast('Asked everyone to lower their hand');
-    } catch (e) {
-      console.error('lowerAllHands failed:', e);
-    }
-  }
-
-  // ------------------------------------
-  // Raise-hand Toast Queue
-  // ------------------------------------
-  function enqueueRaiseHandToast(name) {
-    _raiseHandToastQueue.push(name);
-    _drainRaiseHandToasts();
-  }
-
-  function _drainRaiseHandToasts() {
-    if (_raiseHandToastActive) return;
-    const next = _raiseHandToastQueue.shift();
-    if (!next) return;
-    _raiseHandToastActive = true;
-    _showRaiseHandToast(`${next} raised their hand`, () => {
-      _raiseHandToastActive = false;
-      _drainRaiseHandToasts();
-    });
-  }
-
-  function _showRaiseHandToast(text, onDone) {
-    const toast = document.createElement('div');
-    toast.className = 'raise-hand-toast';
-    toast.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 11V6a2 2 0 0 0-2-2v0a2 2 0 0 0-2 2v0"/><path d="M14 10V4a2 2 0 0 0-2-2v0a2 2 0 0 0-2 2v2"/><path d="M10 10.5V6a2 2 0 0 0-2-2v0a2 2 0 0 0-2 2v8"/><path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15"/></svg><span></span>';
-    toast.querySelector('span').textContent = text;
-    document.body.appendChild(toast);
-    // Auto-dismiss after 3s, then trigger callback so the next queued toast can show.
-    setTimeout(() => {
-      toast.classList.add('dismissing');
-      setTimeout(() => {
-        if (toast.parentNode) toast.parentNode.removeChild(toast);
-        if (onDone) onDone();
-      }, 200);
-    }, 3000);
-  }
-
-  // Generic transient confirmation toast (used for "asked everyone to lower their hand").
-  function showSimpleToast(text) {
-    const toast = document.createElement('div');
-    toast.className = 'raise-hand-toast';
-    toast.textContent = text;
-    document.body.appendChild(toast);
-    setTimeout(() => {
-      toast.classList.add('dismissing');
-      setTimeout(() => { if (toast.parentNode) toast.parentNode.removeChild(toast); }, 200);
-    }, 2500);
-  }
-
   function setupCallControls() {
     $('btn-mic').addEventListener('click', async () => {
       if (!state.room) return;
@@ -1117,15 +776,32 @@
 
     $('btn-screen-share').addEventListener('click', () => toggleScreenShare());
 
-    $('btn-raise-hand').addEventListener('click', () => toggleRaiseHand());
-    $('btn-lower-all-hands').addEventListener('click', () => lowerAllHands());
-
     $('btn-chat').addEventListener('click', () => chatTogglePanel());
 
     $('btn-hangup').addEventListener('click', () => {
-      if (state.room) state.room.disconnect();
-      endCall();
+      if (state.isHost) {
+        showHangupChoiceDialog();
+      } else {
+        if (state.room) state.room.disconnect();
+        endCall();
+      }
     });
+
+    // Host dialog buttons
+    const dlg = $('hangup-dialog');
+    if (dlg) {
+      $('btn-hangup-cancel').addEventListener('click', () => hideHangupChoiceDialog());
+      $('hangup-backdrop').addEventListener('click', () => hideHangupChoiceDialog());
+      $('btn-hangup-leave').addEventListener('click', () => {
+        hideHangupChoiceDialog();
+        if (state.room) state.room.disconnect();
+        endCall();
+      });
+      $('btn-hangup-end-all').addEventListener('click', async () => {
+        hideHangupChoiceDialog();
+        await endMeetingForAll();
+      });
+    }
 
     // Chat controls
     $('btn-close-chat').addEventListener('click', () => chatTogglePanel());
@@ -1142,11 +818,46 @@
       e.target.value = '';
     });
 
-    // Polls
-    setupPollControls();
-
     // Breakouts
-    setupBreakoutControls();
+    const breakoutsBtn = $('btn-breakouts');
+    if (breakoutsBtn) {
+      breakoutsBtn.addEventListener('click', toggleBreakoutHostPanel);
+    }
+    const closeBreakoutPanelBtn = $('btn-close-breakout-panel');
+    if (closeBreakoutPanelBtn) {
+      closeBreakoutPanelBtn.addEventListener('click', () => hideBreakoutHostPanel());
+    }
+    const createBtn = $('btn-breakout-create');
+    if (createBtn) createBtn.addEventListener('click', hostCreateBreakouts);
+    // When the host flips between auto/manual or changes room count, re-render
+    // the per-participant picker list (only visible in manual mode).
+    const assignModeSel = $('breakout-assign-mode');
+    if (assignModeSel) {
+      assignModeSel.addEventListener('change', renderManualAssignPickers);
+    }
+    const roomCountInput = $('breakout-room-count');
+    if (roomCountInput) {
+      roomCountInput.addEventListener('input', renderManualAssignPickers);
+    }
+    const endBtn = $('btn-breakout-end');
+    if (endBtn) endBtn.addEventListener('click', hostEndBreakouts);
+    const broadcastBtn = $('btn-breakout-broadcast');
+    if (broadcastBtn) broadcastBtn.addEventListener('click', hostBroadcast);
+    const helpBtn = $('btn-breakout-help');
+    if (helpBtn) helpBtn.addEventListener('click', participantRequestHelp);
+
+    // Waiting room cancel
+    if ($('btn-cancel-wait')) {
+      $('btn-cancel-wait').addEventListener('click', () => {
+        stopWaitingPoll();
+        // Go back to join screen
+        showScreen('join');
+        const joinBtn = $('btn-join');
+        joinBtn.disabled = !$('guest-name').value.trim();
+        joinBtn.querySelector('.btn-text').textContent = 'Join Call';
+        joinBtn.querySelector('.btn-spinner').classList.add('hidden');
+      });
+    }
   }
 
   // ------------------------------------
@@ -1159,213 +870,58 @@
   }
 
   // ------------------------------------
-  // Breakouts: Room Switch
+  // Host-only hangup choice dialog
   // ------------------------------------
-  // Re-entrancy guard — two DataPackets arriving in quick succession (e.g.
-  // `breakout_assign` followed by a spurious `breakout_ended`) must not fire
-  // two overlapping disconnect/connect cycles. The first switch wins; later
-  // ones are dropped with a log.
-  let _switchingRoom = false;
-
-  /**
-   * Move the local participant from the current LiveKit room to a new one,
-   * preserving mic/cam state. Used by the breakouts flow: receipt of a
-   * `breakout_assign` or `breakout_ended` DataPacket triggers this.
-   *
-   * On failure within 5s we attempt to reconnect to the ORIGINAL room
-   * (from state.joinData). If that also fails, we fall through to endCall().
-   *
-   * @param {Object} opts
-   * @param {string} opts.serverUrl - New room's LiveKit URL (usually same server).
-   * @param {string} opts.token - Fresh token minted by the server for the new room.
-   * @param {string} opts.newRoomName - Human-readable name for logs / state.
-   * @param {string} [opts.reason] - Diagnostic tag for the logs.
-   */
-  async function switchRoom({ serverUrl, token, newRoomName, reason }) {
-    if (_switchingRoom) {
-      console.warn('switchRoom: already in progress, ignoring (reason=' + reason + ')');
-      return;
-    }
-    if (!serverUrl || !token) {
-      console.warn('switchRoom: missing serverUrl/token, aborting');
-      return;
-    }
-    _switchingRoom = true;
-
-    const LivekitClient = window.LivekitClient;
-    if (!LivekitClient) {
-      console.error('switchRoom: LiveKit SDK missing');
-      _switchingRoom = false;
-      return;
-    }
-
-    // Stash original connection params so we can fall back on failure.
-    const originalServerUrl = (state.joinData && state.joinData.server_url) || null;
-    const originalToken = (state.joinData && state.joinData.token) || null;
-    const originalRoomName = (state.joinData && state.joinData.room_name) || null;
-
-    // Capture mic/cam state BEFORE disconnect. These reads are against the
-    // local participant which is about to be gone. Read once, re-apply later.
-    const prev = state.room && state.room.localParticipant;
-    const wasMicEnabled = prev ? (prev.isMicrophoneEnabled ?? false) : false;
-    const wasCamEnabled = prev ? (prev.isCameraEnabled ?? false) : false;
-    const identity = prev ? prev.identity : null;
-
-    // Notify local listeners before we drop the socket. Best-effort only.
-    try {
-      if (prev) {
-        const bye = utf8Encode(JSON.stringify({
-          type: 'room_switched',
-          from: originalRoomName,
-          to: newRoomName,
-          identity,
-        }));
-        // Synchronous-style publish — we intentionally do not await so the
-        // packet does not widen the disconnect window.
-        prev.publishData(bye, { reliable: false }).catch(() => {});
-      }
-    } catch (_) {
-      /* non-critical */
-    }
-
-    // Disconnect the current room. Mirror the cleanup in endCall but do NOT
-    // tear down the whole UI — we're about to reconnect.
-    if (state.room) {
-      try {
-        // Temporarily pause the RoomEvent.Disconnected → endCall handler by
-        // dropping our reference BEFORE disconnect, so endCall doesn't fire.
-        const oldRoom = state.room;
-        state.room = null;
-        try { await oldRoom.disconnect(); } catch (_) { /* no-op */ }
-      } catch (_) {
-        /* no-op */
-      }
-    }
-    // Detach any lingering remote audio elements from the previous room.
-    document.querySelectorAll('audio[data-onfire-remote-audio]').forEach((el) => el.remove());
-    hideEnableAudioPrompt();
-
-    // Reset chime gate so we don't play a chime per pre-existing participant
-    // in the new breakout. Also clear local raise-hand — participants probably
-    // don't want their hand still raised in the new room (breakout is a clean
-    // start, per design note in ADR 0001).
-    state.hasSeenInitialRoster = false;
-    state.isHandRaised = false;
-    try { updateRaiseHandButton(); } catch (_) { /* UI may not be fully wired during tests */ }
-
-    const connectNewRoom = async () => {
-      const room = new LivekitClient.Room({
-        adaptiveStream: true,
-        dynacast: true,
-        videoCaptureDefaults: {
-          resolution: LivekitClient.VideoPresets.h720.resolution,
-        },
-      });
-      state.room = room;
-      setupRoomEvents(room);
-      // 5s budget for the new connect; anything longer reverts to original.
-      await Promise.race([
-        room.connect(serverUrl, token),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('switchRoom connect timeout')), 5000)
-        ),
-      ]);
-      return room;
-    };
-
-    try {
-      const room = await connectNewRoom();
-
-      // Unblock remote audio while the user-gesture chain is still fresh.
-      try { await room.startAudio(); } catch (_) { /* handled by AudioPlaybackStatusChanged */ }
-      if (!room.canPlaybackAudio) showEnableAudioPrompt(room);
-
-      // Re-apply mic/cam. Wrap each independently — failing to re-enable the
-      // camera in a breakout must not leave the participant disconnected.
-      try {
-        await room.localParticipant.setMicrophoneEnabled(wasMicEnabled);
-        state.isMicMuted = !wasMicEnabled;
-      } catch (e) {
-        console.warn('switchRoom: mic re-enable failed:', e);
-      }
-      try {
-        await room.localParticipant.setCameraEnabled(wasCamEnabled);
-        state.isVideoOff = !wasCamEnabled;
-      } catch (e) {
-        console.warn('switchRoom: camera re-enable failed:', e);
-      }
-      updateControlButtons();
-
-      // Update stored join metadata so subsequent reconnects / refetches
-      // resolve against the room we just moved into.
-      if (state.joinData) {
-        state.joinData.token = token;
-        state.joinData.room_name = newRoomName;
-        state.joinData.server_url = serverUrl;
-      }
-
-      renderParticipants();
-      pollListActive().catch(() => {});
-
-      console.log('switchRoom: moved to "' + newRoomName + '" (reason=' + reason + ')');
-    } catch (err) {
-      console.error('switchRoom: failed to connect to "' + newRoomName + '" (' + reason + '):', err);
-
-      // Fallback: try to reconnect to the original room if we still have creds.
-      if (originalServerUrl && originalToken) {
-        try {
-          const room = new LivekitClient.Room({
-            adaptiveStream: true,
-            dynacast: true,
-            videoCaptureDefaults: {
-              resolution: LivekitClient.VideoPresets.h720.resolution,
-            },
-          });
-          state.room = room;
-          setupRoomEvents(room);
-          await room.connect(originalServerUrl, originalToken);
-          try { await room.startAudio(); } catch (_) {}
-          try { await room.localParticipant.setMicrophoneEnabled(wasMicEnabled); } catch (_) {}
-          try { await room.localParticipant.setCameraEnabled(wasCamEnabled); } catch (_) {}
-          state.isMicMuted = !wasMicEnabled;
-          state.isVideoOff = !wasCamEnabled;
-          updateControlButtons();
-          renderParticipants();
-          console.warn('switchRoom: fell back to original room "' + originalRoomName + '"');
-        } catch (fallbackErr) {
-          console.error('switchRoom: fallback reconnect also failed:', fallbackErr);
-          endCall();
-        }
-      } else {
-        // No original creds to fall back to — drop the call cleanly.
-        endCall();
-      }
-    } finally {
-      _switchingRoom = false;
-    }
+  function showHangupChoiceDialog() {
+    const dlg = $('hangup-dialog');
+    if (!dlg) return;
+    dlg.classList.remove('hidden');
   }
 
-  function utf8Encode(str) {
-    return new TextEncoder().encode(str);
+  function hideHangupChoiceDialog() {
+    const dlg = $('hangup-dialog');
+    if (!dlg) return;
+    dlg.classList.add('hidden');
+  }
+
+  async function endMeetingForAll() {
+    // Broadcast room_ended to every participant so they disconnect instantly,
+    // then flip is_active=false server-side so new joiners are rejected.
+    try {
+      if (state.room) {
+        const msg = { type: 'room_ended', at: Date.now() };
+        const data = new TextEncoder().encode(JSON.stringify(msg));
+        try {
+          await state.room.localParticipant.publishData(data, { reliable: true });
+        } catch (e) {
+          console.warn('publishData(room_ended) failed:', e);
+        }
+      }
+    } finally {
+      // Server-side close is the durable guard — run it even if the broadcast
+      // fails, so late joiners hit "Meeting ended".
+      try {
+        await endCallLinkAsHost(state.token, state.hostToken);
+      } catch (e) {
+        console.warn('end_call_link_as_host failed:', e);
+      }
+      if (state.room) {
+        try { state.room.disconnect(); } catch (e) {}
+      }
+      endCall({ endedByHost: true, asHost: true });
+    }
   }
 
   // ------------------------------------
   // End Call
   // ------------------------------------
   let _endingCall = false;
-  function endCall() {
+  function endCall(opts) {
     if (_endingCall) return;
     _endingCall = true;
+    opts = opts || {};
 
-    // Host-token holder: tell the backend the meeting is over so the call_link
-    // is marked ended, remaining guests are disconnected by LiveKit, and the
-    // topic gets archived. Fire-and-forget — we still tear down the local UI
-    // on failure. Only runs when joined via ?host=<host_token>.
-    if (state.hostToken && state.token) {
-      endCallLinkAsHost(state.token, state.hostToken).catch((e) => {
-        console.warn('end_call_link_as_host failed:', e && e.message);
-      });
-    }
+    stopWaitingPoll();
 
     if (state.timerInterval) {
       clearInterval(state.timerInterval);
@@ -1381,40 +937,8 @@
     state.isScreenSharing = false;
     state.remoteScreenShareTrack = null;
     state.remoteScreenShareParticipant = null;
-    state.hasSeenInitialRoster = false;
-    state.isHandRaised = false;
     updateScreenShareButton();
-    updateRaiseHandButton();
     hideScreenShareView();
-
-    // Clean up audio playback UI and attached remote audio elements
-    hideEnableAudioPrompt();
-    document.querySelectorAll('audio[data-onfire-remote-audio]').forEach((el) => el.remove());
-
-    // Clear breakout state and UI
-    breakoutsTearDown();
-
-    // Tear down the unified chat realtime + polling so no requests fire after hangup.
-    teardownUnifiedChat();
-    // Reset chat UI state so a rejoin starts with an empty panel.
-    chatMessages.length = 0;
-    chatUnreadCount = 0;
-    chatPanelOpen = false;
-    const chatPanelEl = document.getElementById('chat-panel');
-    if (chatPanelEl) chatPanelEl.classList.add('hidden');
-    const chatBadgeEl = document.getElementById('chat-badge');
-    if (chatBadgeEl) { chatBadgeEl.textContent = '0'; chatBadgeEl.classList.add('hidden'); }
-
-    // Clear poll state and close poll UI
-    pollState.polls.clear();
-    pollState.inflight.clear();
-    pollState.panelOpen = false;
-    const pollPanelEl = document.getElementById('poll-panel');
-    if (pollPanelEl) pollPanelEl.classList.add('hidden');
-    const pollBadge = document.getElementById('poll-badge');
-    if (pollBadge) { pollBadge.textContent = '0'; pollBadge.classList.add('hidden'); }
-    const createModal = document.getElementById('poll-create-modal');
-    if (createModal) createModal.classList.add('hidden');
 
     if (state.room) {
       try { state.room.disconnect(); } catch (e) {}
@@ -1422,6 +946,18 @@
     }
 
     $('ended-duration').textContent = durationText;
+
+    // Messaging & rejoin visibility depend on why the call ended.
+    const endedTitle = document.querySelector('#screen-ended h2');
+    const rejoinBtn = $('btn-rejoin');
+    if (opts.endedByHost) {
+      if (endedTitle) endedTitle.textContent = opts.asHost ? 'Meeting Ended' : 'Meeting Ended by Host';
+      if (rejoinBtn) rejoinBtn.style.display = 'none';
+    } else {
+      if (endedTitle) endedTitle.textContent = 'Call Ended';
+      if (rejoinBtn) rejoinBtn.style.display = '';
+    }
+
     showScreen('ended');
 
     $('btn-rejoin').onclick = () => {
@@ -1516,17 +1052,6 @@
     const text = input.value.trim();
     if (!text || !state.room) return;
 
-    // Unified chat path — route through send_call_chat_message RPC. The
-    // Centrifugo/polling layer echoes our own message back; we dedup in
-    // chatAddMessage by id. Render optimistically with a local UUID; when the
-    // echo arrives, the dedup key flips to the server message_id.
-    if (state.chatUnifiedActive) {
-      chatSendMessageUnified(text);
-      input.value = '';
-      $('btn-send-chat').disabled = true;
-      return;
-    }
-
     const msg = {
       type: 'chat_message',
       id: crypto.randomUUID(),
@@ -1551,14 +1076,6 @@
 
   function chatSendFile(file) {
     if (!state.room || !file) return;
-
-    // Unified chat path — upload to R2 directly via presigned PUT, then
-    // register the attachment via send_call_chat_file. 25 MB cap matches the
-    // server-side bound from generate_guest_chat_upload_url.
-    if (state.chatUnifiedActive) {
-      chatSendFileUnified(file);
-      return;
-    }
 
     // Limit file size to 2MB for data channel
     if (file.size > 2 * 1024 * 1024) {
@@ -1608,136 +1125,6 @@
     }
   }
 
-  // ---- Unified chat rendering helper (onfiremobile-nx2a3) ------------------
-  //
-  // Adds a message that originated from the unified path (list_call_chat,
-  // Centrifugo publication, or our own send). Messages carry their server
-  // message_id as .id; dedup uses state.chatSeenMessageIds. Optimistically
-  // rendered outgoing messages use a client-generated UUID as the initial id
-  // and carry .optimisticKey — when the server echo arrives we splice out the
-  // optimistic entry and insert the authoritative one.
-  function chatAddMessage(normalized) {
-    if (!normalized || !normalized.id) return;
-    if (!state.chatSeenMessageIds) state.chatSeenMessageIds = new Set();
-
-    // If the server echo arrives for a message we already rendered
-    // optimistically, replace the optimistic row in place so the id/timestamp
-    // reflect the authoritative server values.
-    if (normalized.isSelf && normalized.optimisticReplaces) {
-      const key = normalized.optimisticReplaces;
-      for (let i = 0; i < chatMessages.length; i++) {
-        if (chatMessages[i].optimisticKey === key) {
-          chatMessages[i] = { ...normalized };
-          state.chatSeenMessageIds.add(normalized.id);
-          chatRenderMessages();
-          if (chatPanelOpen) chatScrollToBottom();
-          return;
-        }
-      }
-    }
-
-    // onfiremobile-wy8hm: echo-before-send race. If Centrifugo (or the poll)
-    // delivers the server row BEFORE the send_* RPC's optimisticReplaces key
-    // was stamped onto our optimistic row, the block above misses and we'd
-    // end up with both the optimistic and authoritative rows on screen.
-    // Fallback dedup: a self-message with the same text arriving within 10s
-    // of an unresolved optimistic row is almost certainly the echo — splice
-    // the optimistic row out first, then let the authoritative one render.
-    if (normalized.isSelf && normalized.text) {
-      const windowMs = 10000;
-      const incomingTs = normalized.timestamp
-        ? new Date(normalized.timestamp).getTime()
-        : Date.now();
-      for (let i = chatMessages.length - 1; i >= 0; i--) {
-        const existing = chatMessages[i];
-        if (!existing.optimisticKey) continue;
-        if (existing.text !== normalized.text) continue;
-        const existingTs = existing.timestamp
-          ? new Date(existing.timestamp).getTime()
-          : 0;
-        if (Math.abs(incomingTs - existingTs) > windowMs) continue;
-        // Found the unresolved optimistic row — replace it so the echo
-        // doesn't double-render. Matches the same contract as the
-        // optimisticReplaces branch above.
-        chatMessages[i] = { ...normalized };
-        state.chatSeenMessageIds.add(normalized.id);
-        chatRenderMessages();
-        if (chatPanelOpen) chatScrollToBottom();
-        return;
-      }
-    }
-
-    if (state.chatSeenMessageIds.has(normalized.id)) return;
-    state.chatSeenMessageIds.add(normalized.id);
-
-    chatMessages.push(normalized);
-
-    // Advance the polling cursor so the fallback doesn't re-fetch us later.
-    if (normalized.timestamp) {
-      const iso = new Date(normalized.timestamp).toISOString();
-      if (!state.chatLastSeenTimestamp || iso > state.chatLastSeenTimestamp) {
-        state.chatLastSeenTimestamp = iso;
-      }
-    }
-
-    chatRenderMessages();
-
-    if (normalized.isSelf) {
-      if (chatPanelOpen) chatScrollToBottom();
-    } else {
-      if (chatPanelOpen) {
-        chatScrollToBottom();
-      } else {
-        chatUnreadCount++;
-        const badge = $('chat-badge');
-        badge.textContent = String(chatUnreadCount);
-        badge.classList.remove('hidden');
-      }
-    }
-  }
-
-  // Normalize a list_call_chat row / Centrifugo publication into the shape the
-  // chat renderer expects. Server shape:
-  //   { id, sender_id, sender_display_name, is_guest_message, content,
-  //     attachments: [...], message_type, created_at }
-  // For attachments: first entry wins (one-attachment-per-message in this path).
-  function normalizeUnifiedMessage(row) {
-    if (!row || !row.id) return null;
-    const createdMs = row.created_at ? Date.parse(row.created_at) : Date.now();
-    const senderName = row.sender_display_name || row.sender_name || 'Guest';
-    const isSelf = !!(row.is_guest_message
-      && state.guestName
-      && row.sender_display_name
-      && row.sender_display_name === state.guestName);
-    const attachments = Array.isArray(row.attachments) ? row.attachments : [];
-    const firstAttachment = attachments.length > 0 ? attachments[0] : null;
-
-    if (firstAttachment || row.message_type === 'file' || row.message_type === 'image') {
-      return {
-        id: row.id,
-        type: 'chat_file',
-        sender: row.sender_id || senderName,
-        senderName: senderName,
-        fileName: (firstAttachment && (firstAttachment.file_name || firstAttachment.name)) || 'file',
-        fileSize: (firstAttachment && (firstAttachment.size_bytes || firstAttachment.size)) || 0,
-        mimeType: (firstAttachment && (firstAttachment.mime || firstAttachment.mime_type)) || 'application/octet-stream',
-        publicUrl: (firstAttachment && (firstAttachment.public_url || firstAttachment.url)) || null,
-        timestamp: createdMs,
-        isSelf,
-      };
-    }
-
-    return {
-      id: row.id,
-      type: 'chat_message',
-      sender: row.sender_id || senderName,
-      senderName: senderName,
-      text: row.content || '',
-      timestamp: createdMs,
-      isSelf,
-    };
-  }
-
   function chatRenderMessages() {
     const container = $('chat-messages');
     container.innerHTML = '';
@@ -1754,63 +1141,26 @@
       }
 
       if (msg.type === 'chat_file') {
-        // Unified path: we have a publicUrl (R2 CDN link). Legacy path: base64
-        // fileData. Also: image MIMEs render an inline thumbnail above the
-        // download card.
-        const mime = msg.mimeType || 'application/octet-stream';
-        const isImage = /^image\//i.test(mime);
-        let hrefUrl = null;
+        const fileEl = document.createElement('a');
+        fileEl.className = 'chat-msg-file';
 
-        if (msg.publicUrl) {
-          hrefUrl = msg.publicUrl;
-        } else if (msg.fileData) {
+        // Create download blob from base64
+        if (msg.fileData) {
           try {
             const byteChars = atob(msg.fileData);
             const byteNums = new Array(byteChars.length);
             for (let i = 0; i < byteChars.length; i++) byteNums[i] = byteChars.charCodeAt(i);
-            const blob = new Blob([new Uint8Array(byteNums)], { type: mime });
-            hrefUrl = URL.createObjectURL(blob);
-          } catch (e) {
-            hrefUrl = null;
-          }
-        }
-
-        if (isImage && hrefUrl) {
-          const thumb = document.createElement('a');
-          thumb.className = 'chat-msg-image';
-          thumb.href = hrefUrl;
-          thumb.target = '_blank';
-          thumb.rel = 'noopener noreferrer';
-          const img = document.createElement('img');
-          img.src = hrefUrl;
-          img.alt = msg.fileName || 'image';
-          img.loading = 'lazy';
-          img.style.maxWidth = '220px';
-          img.style.maxHeight = '220px';
-          img.style.borderRadius = '8px';
-          img.style.display = 'block';
-          thumb.appendChild(img);
-          wrapper.appendChild(thumb);
-        }
-
-        const fileEl = document.createElement('a');
-        fileEl.className = 'chat-msg-file';
-        if (hrefUrl) {
-          fileEl.href = hrefUrl;
-          // Unified-path URLs open in a new tab; legacy blob URLs still download.
-          if (msg.publicUrl) {
-            fileEl.target = '_blank';
-            fileEl.rel = 'noopener noreferrer';
-          } else {
+            const blob = new Blob([new Uint8Array(byteNums)], { type: msg.mimeType || 'application/octet-stream' });
+            fileEl.href = URL.createObjectURL(blob);
             fileEl.download = msg.fileName;
+          } catch (e) {
+            fileEl.href = '#';
           }
-        } else {
-          fileEl.href = '#';
         }
 
         fileEl.innerHTML = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>'
           + '<div class="chat-msg-file-info">'
-          + '<div class="chat-msg-file-name">' + escapeHtml(msg.fileName || 'file') + '</div>'
+          + '<div class="chat-msg-file-name">' + escapeHtml(msg.fileName) + '</div>'
           + '<div class="chat-msg-file-size">' + formatFileSize(msg.fileSize) + '</div>'
           + '</div>';
 
@@ -1852,1870 +1202,43 @@
   }
 
   // ------------------------------------
-  // Unified Chat Module (onfiremobile-nx2a3)
+  // Waiting Room
   // ------------------------------------
-  // Flow when state.chatUnifiedEnabled && state.callChat.enabled:
-  //   1. Backfill history via list_call_chat(token, null) — late joiners see
-  //      prior messages for this topic.
-  //   2. Mint a guest Centrifugo sub-token via generate_guest_centrifugo_token
-  //      and open a WebSocket to wss://api2.onfire.so/connection/websocket.
-  //   3. Subscribe to the channel "conversation:<uuid>" — the Postgres trigger
-  //      in mesh_sync_schema.sql emits every new message to that channel.
-  //   4. On WS failure (CSP blocks wss, token mint fails, connection drops and
-  //      can't reconnect) fall back to 3-second polling of list_call_chat with
-  //      the timestamp cursor.
-  //
-  // Sending:
-  //   - Optimistic render with a client-side key so the UI is snappy.
-  //   - POST to send_call_chat_message / send_call_chat_file.
-  //   - The Centrifugo echo (or next poll) carries the server message_id —
-  //     chatAddMessage splices the optimistic row out and inserts the
-  //     authoritative one (see `optimisticReplaces`).
+  function showWaitingScreen(guestName) {
+    $('waiting-guest-name').textContent = guestName ? 'Joining as ' + guestName : '';
+    showScreen('waiting');
 
-  const CHAT_POLL_INTERVAL_MS = 3000;
-  const CHAT_MAX_FILE_BYTES = 25 * 1024 * 1024; // matches server cap in generate_guest_chat_upload_url
-
-  async function initUnifiedChat() {
-    if (!state.chatUnifiedEnabled || !state.callChat || !state.callChat.enabled) return;
-    if (state.chatUnifiedActive) return;
-
-    state.chatUnifiedActive = true;
-    state.chatSeenMessageIds = new Set();
-    state.chatLastSeenTimestamp = null;
-
-    // 1. Backfill.
-    try {
-      const history = await listCallChat(state.token, null);
-      if (Array.isArray(history)) {
-        for (const row of history) {
-          const norm = normalizeUnifiedMessage(row);
-          if (norm) chatAddMessage(norm);
-        }
-      }
-    } catch (err) {
-      console.warn('Unified chat backfill failed:', err && err.message);
-    }
-
-    // 2. Subscribe (Centrifugo) — polling fallback if that fails.
-    await startChatRealtime();
-  }
-
-  async function startChatRealtime() {
-    // Polling-only fallback is safe if the global Centrifuge class isn't
-    // available (CDN load failure) or the CSP blocks the WS connection.
-    if (typeof window.Centrifuge !== 'function') {
-      console.warn('Centrifuge SDK not loaded — falling back to polling.');
-      startChatPolling();
-      return;
-    }
-
-    let tokenData;
-    try {
-      tokenData = await generateGuestCentrifugoToken(state.token);
-    } catch (err) {
-      console.warn('generate_guest_centrifugo_token failed:', err && err.message);
-      startChatPolling();
-      return;
-    }
-    if (!tokenData || tokenData.error || !tokenData.sub_token || !tokenData.channel) {
-      console.warn('generate_guest_centrifugo_token returned error:', tokenData && tokenData.error);
-      startChatPolling();
-      return;
-    }
-
-    try {
-      // Centrifugo is reachable on the main API host. If the CSP
-      // connect-src does not include wss://api2.onfire.so, the browser will
-      // block this and fire a `disconnected` event — we catch it and poll.
-      const wsUrl = API_BASE.replace(/^https:/i, 'wss:').replace(/^http:/i, 'ws:') + '/connection/websocket';
-      const cf = new window.Centrifuge(wsUrl, {
-        token: tokenData.sub_token,
-        // Keep reconnect tries modest — if the CSP is blocking we want to
-        // fall back to polling quickly rather than spam retries.
-        minReconnectDelay: 1000,
-        maxReconnectDelay: 10000,
-      });
-
-      state.centrifuge = cf;
-
-      let connected = false;
-      let fellBack = false;
-      const fallback = (reason) => {
-        if (fellBack) return;
-        fellBack = true;
-        console.warn('Centrifugo unavailable, falling back to polling:', reason);
-        try { cf.disconnect(); } catch (_) {}
-        state.centrifuge = null;
-        state.centrifugeSubscription = null;
-        startChatPolling();
-      };
-
-      cf.on('connected', () => {
-        connected = true;
-      });
-
-      cf.on('error', (ctx) => {
-        console.debug('Centrifugo error:', ctx && ctx.error);
-      });
-
-      cf.on('disconnected', (ctx) => {
-        // Terminal disconnect (auth failure, CSP block, explicit
-        // unrecoverable). Code 3xxx/4xxx with no reconnect schedule → fall
-        // back. Transient disconnects keep reconnecting.
-        if (!connected) {
-          fallback(ctx && ctx.reason);
-        }
-      });
-
-      const sub = cf.newSubscription(tokenData.channel);
-      state.centrifugeSubscription = sub;
-
-      sub.on('publication', (ctx) => {
-        try {
-          const data = ctx && ctx.data;
-          if (!data) return;
-          // The trigger publishes the chat_messages row directly. Normalize it
-          // into the shared renderer shape.
-          const norm = normalizeUnifiedMessage(data);
-          if (norm) chatAddMessage(norm);
-        } catch (e) {
-          console.warn('Centrifugo publication handler failed:', e && e.message);
-        }
-      });
-
-      sub.on('error', (ctx) => {
-        console.debug('Subscription error:', ctx && ctx.error);
-      });
-
-      sub.subscribe();
-      cf.connect();
-
-      // If we haven't reached `connected` within 5s, the browser likely
-      // blocked the WS (CSP) or the server is unreachable — fall back.
-      setTimeout(() => {
-        if (!connected && !fellBack) fallback('connect-timeout');
-      }, 5000);
-    } catch (err) {
-      console.warn('Centrifugo init threw, falling back to polling:', err && err.message);
-      startChatPolling();
-    }
-  }
-
-  function startChatPolling() {
-    if (state.chatPollTimer) return;
-    const tick = async () => {
-      if (!state.chatUnifiedActive) return;
+    // Poll for admission every 3 seconds
+    stopWaitingPoll();
+    state.waitingPollTimer = setInterval(async () => {
       try {
-        const since = state.chatLastSeenTimestamp; // null → full backfill; we already did that, so fine
-        const rows = await listCallChat(state.token, since);
-        if (Array.isArray(rows)) {
-          for (const row of rows) {
-            const norm = normalizeUnifiedMessage(row);
-            if (norm) chatAddMessage(norm);
-          }
-        }
-      } catch (err) {
-        console.debug('list_call_chat poll failed:', err && err.message);
-      }
-    };
-    state.chatPollTimer = setInterval(tick, CHAT_POLL_INTERVAL_MS);
-    // Nudge once immediately so the cursor is fresh, then rely on the interval.
-    tick();
-  }
+        // Re-attempt join — if admitted, server returns token
+        const data = await joinCallAsGuest(state.token, guestName);
+        if (data.error) return; // still waiting or rejected
 
-  function chatSendMessageUnified(text) {
-    const optimisticKey = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : ('opt-' + Date.now() + '-' + Math.random());
-    const optimisticTs = Date.now();
-    chatAddMessage({
-      id: optimisticKey,
-      type: 'chat_message',
-      sender: 'self',
-      senderName: state.guestName || 'You',
-      text,
-      timestamp: optimisticTs,
-      isSelf: true,
-      optimisticKey,
-    });
-
-    sendCallChatMessage(state.token, state.guestName, text)
-      .then((resp) => {
-        if (resp && resp.error) {
-          console.warn('send_call_chat_message error:', resp.error);
-          chatMarkOptimisticFailed(optimisticKey, resp.error);
+        if (data.admission_status === 'rejected') {
+          stopWaitingPoll();
+          showError('Not Admitted', data.rejection_reason || 'The host did not admit you to this meeting.');
           return;
         }
-        if (resp && resp.message_id) {
-          // Splice the optimistic row with the authoritative server copy.
-          const createdMs = resp.created_at ? Date.parse(resp.created_at) : optimisticTs;
-          chatAddMessage({
-            id: resp.message_id,
-            type: 'chat_message',
-            sender: 'self',
-            senderName: state.guestName || 'You',
-            text,
-            timestamp: createdMs,
-            isSelf: true,
-            optimisticReplaces: optimisticKey,
-          });
+
+        if (data.token && data.admission_status !== 'waiting') {
+          // Admitted! Stop polling and join
+          stopWaitingPoll();
+          state.joinData = data;
+          await startCall(data);
         }
-      })
-      .catch((err) => {
-        console.warn('send_call_chat_message threw:', err && err.message);
-        chatMarkOptimisticFailed(optimisticKey, 'Send failed');
-      });
-  }
-
-  async function chatSendFileUnified(file) {
-    if (!file) return;
-    if (file.size > CHAT_MAX_FILE_BYTES) {
-      alert('File must be under 25 MB');
-      return;
-    }
-
-    const optimisticKey = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : ('opt-' + Date.now() + '-' + Math.random());
-    chatAddMessage({
-      id: optimisticKey,
-      type: 'chat_file',
-      sender: 'self',
-      senderName: state.guestName || 'You',
-      fileName: file.name,
-      fileSize: file.size,
-      mimeType: file.type || 'application/octet-stream',
-      publicUrl: null, // will arrive via server echo
-      timestamp: Date.now(),
-      isSelf: true,
-      optimisticKey,
-      uploading: true,
-    });
-
-    try {
-      const presign = await generateGuestChatUploadUrl(
-        state.token,
-        file.name,
-        file.type || 'application/octet-stream',
-        file.size,
-      );
-      if (!presign || presign.error || !presign.put_url || !presign.r2_key) {
-        throw new Error(presign && presign.error ? presign.error : 'No presign URL');
+      } catch (err) {
+        console.debug('Waiting poll:', err.message);
       }
+    }, 3000);
+  }
 
-      // Respect the server's reported cap if it's stricter than our local one.
-      if (presign.max_size_bytes && file.size > presign.max_size_bytes) {
-        throw new Error('File exceeds server size limit');
-      }
-
-      const putResp = await fetch(presign.put_url, {
-        method: 'PUT',
-        headers: { 'Content-Type': file.type || 'application/octet-stream' },
-        body: file,
-      });
-      if (!putResp.ok) {
-        throw new Error('R2 upload failed: ' + putResp.status);
-      }
-
-      const sendResp = await sendCallChatFile(
-        state.token,
-        state.guestName,
-        file.name,
-        file.type || 'application/octet-stream',
-        presign.r2_key,
-        file.size,
-      );
-      if (!sendResp || sendResp.error) {
-        throw new Error(sendResp && sendResp.error ? sendResp.error : 'send_call_chat_file failed');
-      }
-      // Splice with authoritative row.
-      const createdMs = sendResp.created_at ? Date.parse(sendResp.created_at) : Date.now();
-      chatAddMessage({
-        id: sendResp.message_id,
-        type: 'chat_file',
-        sender: 'self',
-        senderName: state.guestName || 'You',
-        fileName: file.name,
-        fileSize: file.size,
-        mimeType: file.type || 'application/octet-stream',
-        publicUrl: presign.public_url,
-        timestamp: createdMs,
-        isSelf: true,
-        optimisticReplaces: optimisticKey,
-      });
-    } catch (err) {
-      console.warn('chatSendFileUnified failed:', err && err.message);
-      chatMarkOptimisticFailed(optimisticKey, err && err.message ? err.message : 'Upload failed');
+  function stopWaitingPoll() {
+    if (state.waitingPollTimer) {
+      clearInterval(state.waitingPollTimer);
+      state.waitingPollTimer = null;
     }
-  }
-
-  function chatMarkOptimisticFailed(optimisticKey, reason) {
-    for (let i = 0; i < chatMessages.length; i++) {
-      if (chatMessages[i].optimisticKey === optimisticKey) {
-        chatMessages[i].failed = true;
-        chatMessages[i].failedReason = reason;
-        break;
-      }
-    }
-    chatRenderMessages();
-  }
-
-  function teardownUnifiedChat() {
-    state.chatUnifiedActive = false;
-    if (state.chatPollTimer) {
-      clearInterval(state.chatPollTimer);
-      state.chatPollTimer = null;
-    }
-    if (state.centrifugeSubscription) {
-      try { state.centrifugeSubscription.unsubscribe(); } catch (_) {}
-      state.centrifugeSubscription = null;
-    }
-    if (state.centrifuge) {
-      try { state.centrifuge.disconnect(); } catch (_) {}
-      state.centrifuge = null;
-    }
-    state.chatSeenMessageIds = null;
-    state.chatLastSeenTimestamp = null;
-  }
-
-  // ------------------------------------
-  // Breakouts Module (host + participant UI)
-  // ------------------------------------
-  // Architecture recap (see ADR 0001):
-  //   - Breakout rooms named "<mainroom>:br:<N>".
-  //   - Host creates session via /rpc/create_breakout_session. Server returns
-  //     per-assignment LiveKit tokens. Host fans them out via DataPacket with
-  //     destinationIdentities so only the targeted participant gets moved.
-  //   - Timer worker posts {type:'breakout_ended', main_room} to each breakout
-  //     room when the timer expires OR when a host ends early. Clients re-mint
-  //     their own main-room token via joinCallAsGuest (worker doesn't send one).
-  //   - Host broadcast persists server-side on the session row; clients poll
-  //     get_breakout_session every 5s while in a breakout and show new broadcasts
-  //     as toasts (we can't publishData to rooms we're not connected to).
-
-  const BREAKOUT_POLL_INTERVAL_MS = 5000;
-  const BREAKOUT_ASSIGN_COUNTDOWN_S = 3;
-
-  // ---- Helpers ----
-  function breakoutsLocalIdentity() {
-    return (state.room && state.room.localParticipant && state.room.localParticipant.identity) || null;
-  }
-
-  function breakoutsLocalName() {
-    return (state.room && state.room.localParticipant && state.room.localParticipant.name)
-      || state.guestName
-      || 'You';
-  }
-
-  function breakoutsParentRoom() {
-    // Parent = main room. While inside a breakout we've cached it; otherwise
-    // the current room name is the parent.
-    if (state.breakoutParentRoom) return state.breakoutParentRoom;
-    const jd = state.joinData || {};
-    return jd.room_name || jd.roomName || (state.room && state.room.name) || null;
-  }
-
-  function breakoutsOnCallJoined() {
-    const btn = $('btn-breakouts');
-    if (btn) {
-      // Show only to hosts. Gate is state.isHost (from joinData.is_host OR
-      // ?forceHost=1 dev shortcut).
-      if (state.isHost) btn.classList.remove('hidden');
-      else btn.classList.add('hidden');
-    }
-
-    // If a host rejoins and there's an active breakout session, pick it up.
-    if (state.isHost) {
-      breakoutFetchSession().catch((e) => console.warn('breakoutFetchSession failed on join:', e));
-    }
-  }
-
-  function breakoutsTearDown() {
-    // Stop polls + timers regardless of which mode we were in.
-    if (state.breakoutPollTimer) { clearInterval(state.breakoutPollTimer); state.breakoutPollTimer = null; }
-    if (state.breakoutTimerTick) { clearInterval(state.breakoutTimerTick); state.breakoutTimerTick = null; }
-    if (state.breakoutAssignTimer) { clearTimeout(state.breakoutAssignTimer); state.breakoutAssignTimer = null; }
-
-    state.breakoutSession = null;
-    state.inBreakout = false;
-    state.breakoutParentRoom = null;
-    state.breakoutClosesAt = null;
-    state.breakoutRoomLabel = null;
-    state.breakoutLastBroadcastAt = null;
-    state.breakoutHelpInflight = false;
-
-    // UI resets
-    const panel = $('breakout-panel'); if (panel) panel.classList.add('hidden');
-    const banner = $('breakout-banner'); if (banner) banner.classList.add('hidden');
-    const hostVisit = $('breakout-host-visit-banner'); if (hostVisit) hostVisit.classList.add('hidden');
-    const overlay = $('breakout-assign-overlay'); if (overlay) overlay.classList.add('hidden');
-    const badge = $('breakout-help-badge'); if (badge) { badge.textContent = '0'; badge.classList.add('hidden'); }
-  }
-
-  function bumpBreakoutHelpBadge() {
-    const badge = $('breakout-help-badge');
-    if (!badge) return;
-    const cur = parseInt(badge.textContent || '0', 10) || 0;
-    badge.textContent = String(cur + 1);
-    badge.classList.remove('hidden');
-  }
-
-  function resetBreakoutHelpBadge() {
-    const badge = $('breakout-help-badge');
-    if (!badge) return;
-    badge.textContent = '0';
-    badge.classList.add('hidden');
-  }
-
-  // ---- RPC wrappers ----
-  async function rpcCreateBreakoutSession(parentRoom, durationSeconds, roomCount, autoAssign, assignments) {
-    return apiCall('create_breakout_session', {
-      p_parent_room: parentRoom,
-      p_creator_identity: breakoutsLocalIdentity(),
-      p_duration_seconds: durationSeconds,
-      p_room_count: roomCount,
-      p_auto_assign: autoAssign,
-      p_assignments: assignments || null,
-    });
-  }
-
-  async function rpcAutoAssign(sessionId, identities) {
-    return apiCall('auto_assign_breakout_participants', {
-      p_session_id: sessionId,
-      p_participant_identities: identities,
-    });
-  }
-
-  async function rpcJoinBreakoutRoom(sessionId, roomId, identity) {
-    return apiCall('join_breakout_room', {
-      p_session_id: sessionId,
-      p_room_id: roomId,
-      p_participant_identity: identity,
-    });
-  }
-
-  async function rpcMoveParticipant(sessionId, identity, targetRoomId) {
-    return apiCall('move_participant_to_breakout', {
-      p_session_id: sessionId,
-      p_participant_identity: identity,
-      p_target_room_id: targetRoomId,
-      p_mover_identity: breakoutsLocalIdentity(),
-    });
-  }
-
-  async function rpcBroadcast(sessionId, message) {
-    return apiCall('broadcast_to_breakouts', {
-      p_session_id: sessionId,
-      p_message: message,
-      p_sender_identity: breakoutsLocalIdentity(),
-    });
-  }
-
-  async function rpcEndSession(sessionId) {
-    return apiCall('end_breakout_session', {
-      p_session_id: sessionId,
-      p_ender_identity: breakoutsLocalIdentity(),
-    });
-  }
-
-  async function rpcRequestHelp(sessionId, roomId) {
-    return apiCall('request_breakout_help', {
-      p_session_id: sessionId,
-      p_room_id: roomId,
-      p_requester_identity: breakoutsLocalIdentity(),
-    });
-  }
-
-  async function rpcResolveHelp(helpId) {
-    return apiCall('resolve_help_request', {
-      p_help_id: helpId,
-      p_resolver_identity: breakoutsLocalIdentity(),
-    });
-  }
-
-  async function rpcGetSession(parentRoom) {
-    return apiCall('get_breakout_session', { p_parent_room: parentRoom });
-  }
-
-  // ---- Participant: assignment takeover + switch ----
-  async function handleBreakoutAssign(msg) {
-    // Reject if we're already mid-switch or already in a breakout.
-    if (!msg || !msg.token || !msg.room_name) return;
-    if (state.inBreakout) return; // ignore duplicate assigns
-
-    const overlay = $('breakout-assign-overlay');
-    const label = msg.room_label || msg.room_name || 'Breakout room';
-    $('breakout-assign-room-label').textContent = label;
-    const secEl = $('breakout-assign-seconds');
-
-    let remaining = BREAKOUT_ASSIGN_COUNTDOWN_S;
-    secEl.textContent = String(remaining);
-    overlay.classList.remove('hidden');
-
-    let cancelled = false;
-    const onCancel = () => { cancelled = true; };
-    const cancelBtn = $('btn-breakout-assign-cancel');
-    cancelBtn.onclick = onCancel;
-
-    // Tick once per second. Prefer requestAnimationFrame-less setInterval to avoid
-    // tab-throttling surprises; 1s is coarse enough.
-    const tick = setInterval(() => {
-      remaining -= 1;
-      if (remaining <= 0) {
-        clearInterval(tick);
-      } else {
-        secEl.textContent = String(remaining);
-      }
-    }, 1000);
-
-    state.breakoutAssignTimer = setTimeout(async () => {
-      clearInterval(tick);
-      overlay.classList.add('hidden');
-      if (cancelled) return;
-
-      // Cache parent-room metadata so we can return on breakout_ended.
-      state.breakoutParentRoom = (state.joinData && state.joinData.room_name) || null;
-      state.breakoutClosesAt = msg.closes_at || (msg.duration_seconds
-        ? new Date(Date.now() + msg.duration_seconds * 1000).toISOString()
-        : null);
-      state.breakoutRoomLabel = label;
-
-      try {
-        await switchRoom({
-          serverUrl: msg.server_url || (state.joinData && state.joinData.server_url),
-          token: msg.token,
-          newRoomName: msg.room_name,
-          reason: 'host_moved_to_breakout',
-        });
-        state.inBreakout = true;
-        showBreakoutBanner();
-        startBreakoutPollLoop();
-        startBreakoutTimerTick();
-      } catch (e) {
-        console.warn('switchRoom (breakout_assign) failed:', e);
-      }
-    }, BREAKOUT_ASSIGN_COUNTDOWN_S * 1000);
-  }
-
-  async function handleBreakoutEnded(msg) {
-    // Worker sends `{type:'breakout_ended', main_room}`. No token — we re-mint.
-    const parent = (msg && msg.main_room) || state.breakoutParentRoom;
-    if (!parent) {
-      console.warn('handleBreakoutEnded: no main_room hint; ignoring');
-      return;
-    }
-    showSimpleToast('Breakout ended. Returning to main room...');
-
-    // For the guest-only web flow we always have a cached token (state.token
-    // is the call link slug). Use joinCallAsGuest to mint a fresh main-room token.
-    try {
-      const data = await joinCallAsGuest(state.token, breakoutsLocalName());
-      if (!data || data.error) {
-        console.error('breakout_ended rejoin failed:', data && data.error);
-        return;
-      }
-      // Update cached join data so subsequent code paths target the main room.
-      state.joinData = data;
-      await switchRoom({
-        serverUrl: data.server_url,
-        token: data.token,
-        newRoomName: data.room_name,
-        reason: 'breakout_ended',
-      });
-      // Tear down breakout-mode UI after successful return.
-      stopBreakoutPollLoop();
-      stopBreakoutTimerTick();
-      state.inBreakout = false;
-      state.breakoutParentRoom = null;
-      state.breakoutClosesAt = null;
-      state.breakoutRoomLabel = null;
-      hideBreakoutBanner();
-      hideHostVisitBanner();
-    } catch (e) {
-      console.error('handleBreakoutEnded rejoin threw:', e);
-    }
-  }
-
-  // ---- Participant banner + timer ----
-  function showBreakoutBanner() {
-    const banner = $('breakout-banner');
-    if (!banner) return;
-    $('breakout-banner-label').textContent = state.breakoutRoomLabel || 'Breakout';
-    banner.classList.remove('hidden');
-  }
-  function hideBreakoutBanner() {
-    const banner = $('breakout-banner');
-    if (banner) banner.classList.add('hidden');
-  }
-
-  function showHostVisitBanner() {
-    const el = $('breakout-host-visit-banner');
-    if (el) el.classList.remove('hidden');
-  }
-  function hideHostVisitBanner() {
-    const el = $('breakout-host-visit-banner');
-    if (el) el.classList.add('hidden');
-  }
-
-  function breakoutTimerString() {
-    if (!state.breakoutClosesAt) return '--:--';
-    const ms = new Date(state.breakoutClosesAt).getTime() - Date.now();
-    if (isNaN(ms)) return '--:--';
-    if (ms <= 0) return 'Closing...';
-    const s = Math.floor(ms / 1000);
-    const m = Math.floor(s / 60);
-    const ss = s % 60;
-    return `${String(m).padStart(2, '0')}:${String(ss).padStart(2, '0')}`;
-  }
-
-  function startBreakoutTimerTick() {
-    stopBreakoutTimerTick();
-    const tick = () => {
-      const s = breakoutTimerString();
-      const bt = $('breakout-banner-timer'); if (bt) bt.textContent = s;
-      const pt = $('breakout-panel-timer'); if (pt) pt.textContent = s;
-    };
-    tick();
-    state.breakoutTimerTick = setInterval(tick, 1000);
-  }
-  function stopBreakoutTimerTick() {
-    if (state.breakoutTimerTick) { clearInterval(state.breakoutTimerTick); state.breakoutTimerTick = null; }
-  }
-
-  // ---- Broadcast toast ----
-  function showBreakoutBroadcastToast(message, broadcastAt) {
-    if (!message) return;
-    // Dedupe: skip if we've already shown this broadcast (arrived via poll + packet).
-    if (broadcastAt && state.breakoutLastBroadcastAt === broadcastAt) return;
-    state.breakoutLastBroadcastAt = broadcastAt;
-
-    const toast = document.createElement('div');
-    toast.className = 'breakout-broadcast-toast';
-    const strong = document.createElement('strong');
-    strong.textContent = 'Host:';
-    const span = document.createElement('span');
-    span.textContent = ' ' + message;
-    toast.appendChild(strong);
-    toast.appendChild(span);
-    document.body.appendChild(toast);
-    setTimeout(() => {
-      toast.classList.add('dismissing');
-      setTimeout(() => { if (toast.parentNode) toast.parentNode.removeChild(toast); }, 200);
-    }, 4000);
-  }
-
-  // ---- Session poll loop ----
-  function startBreakoutPollLoop() {
-    stopBreakoutPollLoop();
-    const run = () => {
-      const parent = state.breakoutParentRoom || breakoutsParentRoom();
-      if (!parent) return;
-      rpcGetSession(parent).then((session) => onBreakoutSessionTick(session)).catch(() => {});
-    };
-    run();
-    state.breakoutPollTimer = setInterval(run, BREAKOUT_POLL_INTERVAL_MS);
-  }
-
-  function stopBreakoutPollLoop() {
-    if (state.breakoutPollTimer) { clearInterval(state.breakoutPollTimer); state.breakoutPollTimer = null; }
-  }
-
-  async function breakoutFetchSession() {
-    const parent = breakoutsParentRoom();
-    if (!parent) return null;
-    try {
-      const session = await rpcGetSession(parent);
-      onBreakoutSessionTick(session);
-      return session;
-    } catch (e) {
-      console.warn('breakoutFetchSession threw:', e);
-      return null;
-    }
-  }
-
-  function onBreakoutSessionTick(session) {
-    // Session may be { session_id: null } or null when no active breakout.
-    const valid = session && session.session_id && session.status && session.status !== 'closed';
-
-    // Update host UI state
-    if (valid) {
-      const prevBroadcastAt = state.breakoutSession && state.breakoutSession.broadcast_at;
-      state.breakoutSession = session;
-      if (session.closes_at) state.breakoutClosesAt = session.closes_at;
-
-      // Broadcast from host: show toast if new broadcast_at appeared.
-      if (session.broadcast_at && session.broadcast_at !== prevBroadcastAt
-          && session.broadcast_message) {
-        showBreakoutBroadcastToast(session.broadcast_message, session.broadcast_at);
-      }
-
-      // Re-render host panel if open.
-      if (state.isHost && !$('breakout-panel').classList.contains('hidden')) {
-        renderBreakoutActiveView();
-      }
-    } else {
-      // Session closed or missing. If we're inside a breakout and haven't heard
-      // breakout_ended yet, treat this as the fallback closure signal.
-      if (state.inBreakout && state.breakoutClosesAt
-          && Date.now() > new Date(state.breakoutClosesAt).getTime() + 15000) {
-        handleBreakoutEnded({ main_room: state.breakoutParentRoom }).catch(() => {});
-      }
-      if (!state.inBreakout) {
-        state.breakoutSession = null;
-        // If host panel is open in create mode, no-op.
-      }
-    }
-  }
-
-  // ---- Participant actions ----
-  async function breakoutRequestHelp() {
-    if (state.breakoutHelpInflight) return;
-    if (!state.breakoutSession || !state.breakoutSession.session_id) return;
-    // Derive our current room id from the session's rooms list by room_name.
-    const myRoomName = (state.room && state.room.name) || (state.joinData && state.joinData.room_name);
-    const room = (state.breakoutSession.rooms || []).find((r) => r.room_name === myRoomName);
-    if (!room) {
-      console.warn('breakoutRequestHelp: room not found in session');
-      return;
-    }
-    state.breakoutHelpInflight = true;
-    const btn = $('btn-breakout-help');
-    if (btn) { btn.textContent = 'Sending...'; btn.disabled = true; }
-    try {
-      await rpcRequestHelp(state.breakoutSession.session_id, room.id);
-      // Light up the "Help requested ✓" confirmation for 10s.
-      if (btn) {
-        btn.textContent = 'Help requested ✓';
-        btn.classList.add('requested');
-        setTimeout(() => {
-          if (!btn) return;
-          btn.textContent = 'Request help';
-          btn.classList.remove('requested');
-          btn.disabled = false;
-          state.breakoutHelpInflight = false;
-        }, 10000);
-      } else {
-        state.breakoutHelpInflight = false;
-      }
-    } catch (e) {
-      console.warn('rpcRequestHelp failed:', e);
-      if (btn) { btn.textContent = 'Request help'; btn.disabled = false; }
-      state.breakoutHelpInflight = false;
-    }
-  }
-
-  async function breakoutLeaveEarly() {
-    // Participant opts out early — just return to the main room.
-    await handleBreakoutEnded({ main_room: state.breakoutParentRoom });
-  }
-
-  async function breakoutReturnToMain() {
-    // Host variant of leave-early when visiting a breakout.
-    await handleBreakoutEnded({ main_room: state.breakoutParentRoom });
-  }
-
-  // ---- Host: panel open/close ----
-  function breakoutPanelOpen() {
-    const panel = $('breakout-panel');
-    if (!panel) return;
-    panel.classList.remove('hidden');
-    resetBreakoutHelpBadge();
-    if (state.breakoutSession && state.breakoutSession.session_id) {
-      showBreakoutActiveView();
-    } else {
-      showBreakoutCreateView();
-    }
-  }
-  function breakoutPanelClose() {
-    const panel = $('breakout-panel');
-    if (panel) panel.classList.add('hidden');
-  }
-
-  function showBreakoutCreateView() {
-    $('breakout-create-view').classList.remove('hidden');
-    $('breakout-active-view').classList.add('hidden');
-    $('btn-breakout-create').classList.remove('hidden');
-    $('btn-breakout-end').classList.add('hidden');
-    $('breakout-panel-title').textContent = 'Create breakout rooms';
-    renderBreakoutCreateForm();
-  }
-
-  function showBreakoutActiveView() {
-    $('breakout-create-view').classList.add('hidden');
-    $('breakout-active-view').classList.remove('hidden');
-    $('btn-breakout-create').classList.add('hidden');
-    $('btn-breakout-end').classList.remove('hidden');
-    $('breakout-panel-title').textContent = 'Active breakout session';
-    renderBreakoutActiveView();
-  }
-
-  // ---- Host: create-form rendering + manual drag-drop ----
-  function breakoutParticipantList() {
-    // All remote + local participants currently connected.
-    if (!state.room) return [];
-    const all = [state.room.localParticipant, ...state.room.remoteParticipants.values()];
-    return all.map((p) => ({
-      identity: p.identity,
-      name: p.name || p.identity,
-      isLocal: p === state.room.localParticipant,
-    }));
-  }
-
-  function renderBreakoutCreateForm() {
-    const manual = document.querySelector('input[name="breakout-mode"]:checked');
-    const mode = manual ? manual.value : 'auto';
-    const manualBlock = $('breakout-manual-assign');
-    if (mode === 'manual') {
-      manualBlock.classList.remove('hidden');
-      renderBreakoutManualAssign();
-    } else {
-      manualBlock.classList.add('hidden');
-    }
-  }
-
-  function renderBreakoutManualAssign() {
-    const count = Math.max(2, Math.min(20, parseInt($('breakout-room-count').value, 10) || 3));
-    const grid = $('breakout-rooms-grid');
-    const unassigned = $('breakout-unassigned-row');
-    if (!grid || !unassigned) return;
-
-    // Preserve current assignments keyed by identity → roomIndex (0..count-1).
-    // Store on the DOM via data attributes of chips to keep renders cheap.
-    const prior = {};
-    document.querySelectorAll('.breakout-participant-chip').forEach((chip) => {
-      const id = chip.getAttribute('data-identity');
-      const roomId = chip.parentElement && chip.parentElement.getAttribute('data-room-id');
-      if (id && roomId) prior[id] = roomId;
-    });
-
-    // Rebuild room columns.
-    grid.innerHTML = '';
-    for (let i = 0; i < count; i++) {
-      const roomId = `room-${i}`;
-      const card = document.createElement('div');
-      card.className = 'breakout-room-card';
-      card.setAttribute('data-room-id', roomId);
-      const head = document.createElement('div');
-      head.className = 'breakout-room-card-header';
-      head.textContent = `Room ${i + 1}`;
-      const inner = document.createElement('div');
-      inner.className = 'breakout-room-card-participants';
-      inner.setAttribute('data-room-id', roomId);
-      card.appendChild(head);
-      card.appendChild(inner);
-      wireBreakoutDragTarget(inner);
-      grid.appendChild(card);
-    }
-
-    // Rebuild chips. Chips land where they were before (prior) or in unassigned.
-    unassigned.innerHTML = '';
-    wireBreakoutDragTarget(unassigned);
-
-    const participants = breakoutParticipantList();
-    participants.forEach((p) => {
-      const chip = document.createElement('div');
-      chip.className = 'breakout-participant-chip';
-      chip.setAttribute('draggable', 'true');
-      chip.setAttribute('data-identity', p.identity);
-      chip.textContent = p.name;
-      chip.addEventListener('dragstart', (e) => {
-        chip.classList.add('dragging');
-        try { e.dataTransfer.setData('text/plain', p.identity); } catch (_) { /* noop */ }
-      });
-      chip.addEventListener('dragend', () => chip.classList.remove('dragging'));
-
-      const targetRoom = prior[p.identity];
-      let targetEl = null;
-      if (targetRoom) {
-        targetEl = document.querySelector(`[data-room-id="${targetRoom}"]`);
-      }
-      if (!targetEl || targetEl === unassigned) {
-        unassigned.appendChild(chip);
-      } else {
-        // targetEl may be the outer card wrapping the participants list;
-        // prefer the inner list if so.
-        const inner = targetEl.classList.contains('breakout-room-card')
-          ? targetEl.querySelector('.breakout-room-card-participants')
-          : targetEl;
-        inner.appendChild(chip);
-      }
-    });
-  }
-
-  function wireBreakoutDragTarget(el) {
-    el.addEventListener('dragover', (e) => {
-      e.preventDefault();
-      el.classList.add('drag-over');
-    });
-    el.addEventListener('dragleave', () => el.classList.remove('drag-over'));
-    el.addEventListener('drop', (e) => {
-      e.preventDefault();
-      el.classList.remove('drag-over');
-      let identity = '';
-      try { identity = e.dataTransfer.getData('text/plain'); } catch (_) { /* noop */ }
-      const chip = identity ? document.querySelector(`.breakout-participant-chip[data-identity="${CSS.escape(identity)}"]`) : null;
-      if (chip) el.appendChild(chip);
-    });
-  }
-
-  function collectManualAssignments() {
-    const assigns = [];
-    document.querySelectorAll('.breakout-rooms-grid .breakout-room-card').forEach((card, idx) => {
-      card.querySelectorAll('.breakout-participant-chip').forEach((chip) => {
-        assigns.push({
-          participant_identity: chip.getAttribute('data-identity'),
-          room_index: idx, // 0-based; server translates into room id
-        });
-      });
-    });
-    return assigns;
-  }
-
-  async function breakoutCreate() {
-    const errEl = $('breakout-create-error');
-    errEl.classList.add('hidden');
-
-    const roomCount = Math.max(2, Math.min(20, parseInt($('breakout-room-count').value, 10) || 3));
-    const durationMin = Math.max(1, Math.min(120, parseInt($('breakout-duration').value, 10) || 15));
-    const durationSec = durationMin * 60;
-    const modeEl = document.querySelector('input[name="breakout-mode"]:checked');
-    const mode = modeEl ? modeEl.value : 'auto';
-    const autoAssign = mode === 'auto';
-    const assignments = autoAssign ? null : collectManualAssignments();
-
-    const parent = breakoutsParentRoom();
-    if (!parent) {
-      errEl.textContent = 'Missing parent room.';
-      errEl.classList.remove('hidden');
-      return;
-    }
-
-    const btn = $('btn-breakout-create');
-    btn.disabled = true;
-    const origText = btn.textContent;
-    btn.textContent = 'Creating...';
-
-    try {
-      const resp = await rpcCreateBreakoutSession(parent, durationSec, roomCount, autoAssign, assignments);
-      // Expected shape: { session: {...}, rooms: [...], assignments: [{participant_identity, room_name, server_url, token, room_label, duration_seconds}, ...] }
-      if (!resp || resp.error) {
-        throw new Error((resp && resp.error) || 'create_breakout_session failed');
-      }
-      const session = resp.session || resp;
-      state.breakoutSession = session;
-      if (session.closes_at) state.breakoutClosesAt = session.closes_at;
-
-      // Fan out per-assignment DataPackets so only the targeted participant
-      // receives their breakout token. LiveKit web SDK 2.9.1:
-      //   localParticipant.publishData(payload, { reliable, destinationIdentities, topic })
-      const perAssign = resp.assignments || session.assignments || [];
-      const serverUrl = (state.joinData && state.joinData.server_url) || null;
-      for (const a of perAssign) {
-        if (!a || !a.participant_identity || !a.token) continue;
-        if (a.participant_identity === breakoutsLocalIdentity()) {
-          // Host isn't auto-moved. Skip.
-          continue;
-        }
-        const payload = {
-          type: 'breakout_assign',
-          server_url: a.server_url || serverUrl,
-          token: a.token,
-          room_name: a.room_name,
-          room_label: a.room_label || a.room_name,
-          duration_seconds: durationSec,
-          closes_at: session.closes_at || null,
-        };
-        try {
-          const buf = new TextEncoder().encode(JSON.stringify(payload));
-          await state.room.localParticipant.publishData(buf, {
-            reliable: true,
-            destinationIdentities: [a.participant_identity],
-          });
-        } catch (e) {
-          console.warn('breakout_assign publishData failed for', a.participant_identity, e);
-        }
-      }
-
-      // Start host-side polling so we see help requests + broadcasts live.
-      startBreakoutPollLoop();
-      startBreakoutTimerTick();
-      showBreakoutActiveView();
-    } catch (e) {
-      console.error('breakoutCreate failed:', e);
-      errEl.textContent = 'Failed to create session.';
-      errEl.classList.remove('hidden');
-    } finally {
-      btn.disabled = false;
-      btn.textContent = origText;
-    }
-  }
-
-  async function breakoutEndNow() {
-    if (!state.breakoutSession || !state.breakoutSession.session_id) return;
-    const btn = $('btn-breakout-end');
-    btn.disabled = true;
-    try {
-      await rpcEndSession(state.breakoutSession.session_id);
-      // Worker will fanout breakout_ended to every breakout room. Host is in
-      // the main room, so we just tear down UI.
-      state.breakoutSession = null;
-      state.breakoutClosesAt = null;
-      stopBreakoutPollLoop();
-      stopBreakoutTimerTick();
-      breakoutPanelClose();
-    } catch (e) {
-      console.error('breakoutEndNow failed:', e);
-    } finally {
-      btn.disabled = false;
-    }
-  }
-
-  async function breakoutBroadcast() {
-    const input = $('breakout-broadcast-input');
-    const message = (input.value || '').trim();
-    if (!message) return;
-    if (!state.breakoutSession || !state.breakoutSession.session_id) return;
-    const btn = $('btn-breakout-broadcast');
-    btn.disabled = true;
-    try {
-      await rpcBroadcast(state.breakoutSession.session_id, message);
-      input.value = '';
-      // Poll will pick up the broadcast_message + broadcast_at and render a
-      // toast on every client within ~5s. We don't fan out a DataPacket here
-      // because the host is only connected to the main room.
-    } catch (e) {
-      console.error('breakoutBroadcast failed:', e);
-    } finally {
-      btn.disabled = false;
-    }
-  }
-
-  async function breakoutVisitRoom(roomId) {
-    if (!state.breakoutSession || !state.breakoutSession.session_id) return;
-    try {
-      const resp = await rpcJoinBreakoutRoom(state.breakoutSession.session_id, roomId, breakoutsLocalIdentity());
-      if (!resp || resp.error) throw new Error((resp && resp.error) || 'join_breakout_room failed');
-      state.breakoutParentRoom = (state.joinData && state.joinData.room_name) || state.breakoutParentRoom;
-      state.breakoutRoomLabel = resp.room_label || resp.room_name || 'Breakout';
-      await switchRoom({
-        serverUrl: resp.server_url || (state.joinData && state.joinData.server_url),
-        token: resp.token,
-        newRoomName: resp.room_name,
-        reason: 'host_visit_breakout',
-      });
-      state.inBreakout = true;
-      showHostVisitBanner();
-      showBreakoutBanner();
-      startBreakoutTimerTick();
-      breakoutPanelClose();
-    } catch (e) {
-      console.error('breakoutVisitRoom failed:', e);
-    }
-  }
-
-  async function breakoutGoToHelpRoom(helpRequest) {
-    await breakoutVisitRoom(helpRequest.room_id);
-  }
-
-  async function breakoutResolveHelp(helpId) {
-    try {
-      await rpcResolveHelp(helpId);
-      // Refresh session immediately so the request disappears from the list.
-      await breakoutFetchSession();
-    } catch (e) {
-      console.error('breakoutResolveHelp failed:', e);
-    }
-  }
-
-  // ---- Host: active-view rendering ----
-  function renderBreakoutActiveView() {
-    const session = state.breakoutSession;
-    if (!session) return;
-
-    // Timer already ticks independently; just set initial value.
-    const pt = $('breakout-panel-timer');
-    if (pt) pt.textContent = breakoutTimerString();
-
-    // Help requests
-    const helpWrap = $('breakout-help-requests');
-    if (helpWrap) {
-      helpWrap.innerHTML = '';
-      const unresolved = (session.help_requests || []).filter((h) => !h.resolved_at);
-      if (unresolved.length > 0) bumpBreakoutHelpBadge();
-      unresolved.forEach((h) => {
-        const card = document.createElement('div');
-        card.className = 'breakout-help-request-card';
-        const text = document.createElement('span');
-        text.textContent = `${h.requester_name || h.requester_identity || 'Someone'} needs help`;
-        const actions = document.createElement('div');
-        actions.className = 'breakout-help-request-actions';
-        const goBtn = document.createElement('button');
-        goBtn.type = 'button';
-        goBtn.textContent = 'Go to room';
-        goBtn.addEventListener('click', () => breakoutGoToHelpRoom(h));
-        const resBtn = document.createElement('button');
-        resBtn.type = 'button';
-        resBtn.textContent = 'Resolve';
-        resBtn.addEventListener('click', () => breakoutResolveHelp(h.id));
-        actions.appendChild(goBtn);
-        actions.appendChild(resBtn);
-        card.appendChild(text);
-        card.appendChild(actions);
-        helpWrap.appendChild(card);
-      });
-    }
-
-    // Room grid
-    const grid = $('breakout-active-rooms-grid');
-    if (grid) {
-      grid.innerHTML = '';
-      (session.rooms || []).forEach((r, idx) => {
-        const card = document.createElement('div');
-        card.className = 'breakout-active-room';
-        const head = document.createElement('div');
-        head.className = 'breakout-active-room-head';
-        const title = document.createElement('span');
-        title.className = 'breakout-active-room-title';
-        title.textContent = r.room_label || `Room ${idx + 1}`;
-        const count = document.createElement('span');
-        count.className = 'breakout-active-room-count';
-        const parts = r.participants || [];
-        count.textContent = `${parts.length} participant${parts.length === 1 ? '' : 's'}`;
-        head.appendChild(title);
-        head.appendChild(count);
-
-        const body = document.createElement('div');
-        body.className = 'breakout-active-room-participants';
-        body.textContent = parts.map((p) => p.name || p.identity).join(', ') || '—';
-
-        const footer = document.createElement('div');
-        footer.className = 'breakout-active-room-footer';
-        const hasHelp = (session.help_requests || []).some((h) => !h.resolved_at && h.room_id === r.id);
-        if (hasHelp) {
-          const badge = document.createElement('span');
-          badge.className = 'breakout-help-badge';
-          badge.textContent = '!';
-          footer.appendChild(badge);
-        } else {
-          footer.appendChild(document.createElement('span'));
-        }
-        const visitBtn = document.createElement('button');
-        visitBtn.className = 'breakout-visit-btn';
-        visitBtn.textContent = 'Visit';
-        visitBtn.addEventListener('click', () => breakoutVisitRoom(r.id));
-        footer.appendChild(visitBtn);
-
-        card.appendChild(head);
-        card.appendChild(body);
-        card.appendChild(footer);
-        grid.appendChild(card);
-      });
-    }
-  }
-
-  function setupBreakoutControls() {
-    const btn = $('btn-breakouts');
-    if (btn) btn.addEventListener('click', breakoutPanelOpen);
-
-    const close = $('btn-close-breakout');
-    if (close) close.addEventListener('click', breakoutPanelClose);
-    const cancel = $('btn-breakout-cancel');
-    if (cancel) cancel.addEventListener('click', breakoutPanelClose);
-
-    const create = $('btn-breakout-create');
-    if (create) create.addEventListener('click', breakoutCreate);
-    const end = $('btn-breakout-end');
-    if (end) end.addEventListener('click', breakoutEndNow);
-
-    // Create-form dynamic bits
-    const roomCount = $('breakout-room-count');
-    if (roomCount) roomCount.addEventListener('input', () => {
-      const modeEl = document.querySelector('input[name="breakout-mode"]:checked');
-      if (modeEl && modeEl.value === 'manual') renderBreakoutManualAssign();
-    });
-    document.querySelectorAll('input[name="breakout-mode"]').forEach((r) => {
-      r.addEventListener('change', renderBreakoutCreateForm);
-    });
-
-    // Broadcast
-    const bcInput = $('breakout-broadcast-input');
-    const bcBtn = $('btn-breakout-broadcast');
-    if (bcInput && bcBtn) {
-      bcInput.addEventListener('input', () => {
-        bcBtn.disabled = !bcInput.value.trim();
-      });
-      bcBtn.addEventListener('click', breakoutBroadcast);
-    }
-
-    // Backdrop dismiss
-    const backdrop = document.querySelector('.breakout-panel-backdrop');
-    if (backdrop) backdrop.addEventListener('click', breakoutPanelClose);
-
-    // Participant banner buttons
-    const helpBtn = $('btn-breakout-help');
-    if (helpBtn) helpBtn.addEventListener('click', breakoutRequestHelp);
-    const leaveBtn = $('btn-breakout-leave');
-    if (leaveBtn) leaveBtn.addEventListener('click', breakoutLeaveEarly);
-    const returnBtn = $('btn-breakout-return-main');
-    if (returnBtn) returnBtn.addEventListener('click', breakoutReturnToMain);
-
-    // Assign-overlay cancel (re-bound per-assign too, but safe to wire once).
-    const assignCancel = $('btn-breakout-assign-cancel');
-    if (assignCancel) assignCancel.addEventListener('click', () => {
-      $('breakout-assign-overlay').classList.add('hidden');
-      if (state.breakoutAssignTimer) { clearTimeout(state.breakoutAssignTimer); state.breakoutAssignTimer = null; }
-    });
-  }
-
-  // ------------------------------------
-  // Polls Module (via PostgREST RPCs + LiveKit Data Channels)
-  // ------------------------------------
-  // In-memory cache of polls shown in the panel.
-  //   key = poll.id (uuid)
-  //   value = {
-  //     id, question, options, poll_type, creator_identity, created_at,
-  //     closed_at?, total_voters?, option_counts?,
-  //     _selectedIndexes: [int],   // UI state for radio/checkbox before voting
-  //     _voted: bool,              // true once we've voted (so button says "Update vote")
-  //     _error?: string,           // inline error from last action on this card
-  //   }
-  const pollState = {
-    polls: new Map(),
-    panelOpen: false,
-    inflight: new Set(), // ids currently being voted/closed to prevent double-fire
-  };
-
-  function pollPanelOpen() {
-    pollState.panelOpen = true;
-    $('poll-panel').classList.remove('hidden');
-    $('btn-polls').classList.add('active');
-    $('poll-badge').classList.add('hidden');
-    pollRenderList();
-  }
-
-  function pollPanelClose() {
-    pollState.panelOpen = false;
-    $('poll-panel').classList.add('hidden');
-    $('btn-polls').classList.remove('active');
-  }
-
-  function pollPanelToggle() {
-    if (pollState.panelOpen) pollPanelClose();
-    else pollPanelOpen();
-  }
-
-  function pollLocalIdentity() {
-    return (state.room && state.room.localParticipant && state.room.localParticipant.identity) || null;
-  }
-
-  function pollRoomName() {
-    // joinData is the payload from join_call_as_guest. Different backend
-    // versions have exposed the LiveKit room name under slightly different
-    // keys, so fall back through the likely candidates before giving up.
-    const jd = state.joinData || {};
-    if (jd.room_name) return jd.room_name;
-    if (jd.roomName) return jd.roomName;
-    if (jd.room && typeof jd.room === 'string') return jd.room;
-    if (jd.room && jd.room.name) return jd.room.name;
-    // Final fallback: the live LiveKit Room object exposes the name.
-    if (state.room && state.room.name) return state.room.name;
-    return null;
-  }
-
-  async function pollPublishDataPacket(payload) {
-    try {
-      if (!state.room || !state.room.localParticipant) return;
-      const buf = new TextEncoder().encode(JSON.stringify(payload));
-      await state.room.localParticipant.publishData(buf, { reliable: true });
-    } catch (e) {
-      console.warn('poll publishData failed:', e);
-    }
-  }
-
-  async function pollListActive() {
-    const roomName = pollRoomName();
-    if (!roomName) return;
-    try {
-      const data = await apiCall('list_active_polls', { p_room_name: roomName });
-      if (!Array.isArray(data)) return;
-      // Merge into local cache, preserving per-card UI state where possible.
-      const seenIds = new Set();
-      for (const p of data) {
-        seenIds.add(p.id);
-        const prev = pollState.polls.get(p.id) || {};
-        pollState.polls.set(p.id, {
-          ...prev,
-          ...p,
-          _selectedIndexes: prev._selectedIndexes || [],
-          _voted: prev._voted || false,
-        });
-      }
-      // Drop cached polls that are no longer active AND aren't closed (they may have been deleted).
-      // Note: closed polls aren't returned by list_active_polls, so we keep them explicitly.
-      for (const [id, card] of pollState.polls) {
-        if (!seenIds.has(id) && !card.closed_at) pollState.polls.delete(id);
-      }
-      pollRenderList();
-    } catch (e) {
-      console.warn('list_active_polls failed:', e);
-    }
-  }
-
-  async function pollFetchResults(pollId) {
-    try {
-      const data = await apiCall('get_poll_results', { p_poll_id: pollId });
-      if (!data || data.error) return;
-      const prev = pollState.polls.get(pollId) || {};
-      // Preserve a client-side closed_at stamp when get_poll_results returns
-      // a payload without the field populated (e.g. older backends or a race
-      // against the close_poll commit). The client stamp is the retention
-      // marker used by pollListActive() to keep the card through refetches.
-      const mergedClosedAt = data.closed_at || prev.closed_at || null;
-      pollState.polls.set(pollId, {
-        ...prev,
-        ...data,
-        closed_at: mergedClosedAt,
-        _selectedIndexes: prev._selectedIndexes || [],
-        _voted: prev._voted || false,
-      });
-      if (pollState.panelOpen) pollRenderList();
-      else pollBumpBadge();
-    } catch (e) {
-      console.warn('get_poll_results failed:', e);
-    }
-  }
-
-  function pollBumpBadge() {
-    const badge = $('poll-badge');
-    if (!badge) return;
-    const current = parseInt(badge.textContent || '0', 10) || 0;
-    badge.textContent = String(current + 1);
-    badge.classList.remove('hidden');
-  }
-
-  // Sorted list: active polls first (newest created first), then closed polls.
-  function pollSortedList() {
-    const all = Array.from(pollState.polls.values());
-    all.sort((a, b) => {
-      const aClosed = !!a.closed_at;
-      const bClosed = !!b.closed_at;
-      if (aClosed !== bClosed) return aClosed ? 1 : -1;
-      const aT = new Date(a.created_at || 0).getTime();
-      const bT = new Date(b.created_at || 0).getTime();
-      return bT - aT;
-    });
-    return all;
-  }
-
-  function pollRenderList() {
-    const listEl = $('poll-list');
-    if (!listEl) return;
-    const polls = pollSortedList();
-    listEl.innerHTML = '';
-    if (polls.length === 0) {
-      const empty = document.createElement('p');
-      empty.className = 'poll-empty';
-      empty.textContent = 'No polls yet. Create the first one!';
-      listEl.appendChild(empty);
-      return;
-    }
-    for (const poll of polls) {
-      listEl.appendChild(pollRenderCard(poll));
-    }
-  }
-
-  function pollRenderCard(poll) {
-    const card = document.createElement('div');
-    card.className = 'poll-card' + (poll.closed_at ? ' closed' : '');
-    card.setAttribute('data-poll-id', poll.id);
-
-    // Header
-    const header = document.createElement('div');
-    header.className = 'poll-card-header';
-
-    const q = document.createElement('div');
-    q.className = 'poll-question';
-    q.textContent = poll.question || '';
-    header.appendChild(q);
-
-    const localIdentity = pollLocalIdentity();
-    const isCreator = localIdentity && poll.creator_identity === localIdentity;
-    if (isCreator && !poll.closed_at) {
-      const closeBtn = document.createElement('button');
-      closeBtn.className = 'poll-close-btn';
-      closeBtn.type = 'button';
-      closeBtn.textContent = 'Close';
-      closeBtn.title = 'Close this poll';
-      closeBtn.addEventListener('click', () => pollClosePoll(poll.id));
-      header.appendChild(closeBtn);
-    }
-
-    card.appendChild(header);
-
-    // Meta
-    const meta = document.createElement('div');
-    meta.className = 'poll-meta';
-    const typeLabel = poll.poll_type === 'multiple' ? 'Multiple choice' : 'Single choice';
-    meta.textContent = typeLabel;
-    card.appendChild(meta);
-
-    const showResults = !!poll.closed_at || poll._voted;
-    const disabled = !!poll.closed_at;
-
-    if (showResults) {
-      card.appendChild(pollRenderResults(poll));
-    } else {
-      card.appendChild(pollRenderInputs(poll));
-    }
-
-    // Actions
-    const actions = document.createElement('div');
-    actions.className = 'poll-actions';
-
-    if (poll.closed_at) {
-      const closedLbl = document.createElement('span');
-      closedLbl.className = 'poll-status closed';
-      closedLbl.textContent = 'Poll closed';
-      actions.appendChild(closedLbl);
-    } else {
-      const voteBtn = document.createElement('button');
-      voteBtn.className = 'poll-vote-btn';
-      voteBtn.type = 'button';
-      voteBtn.textContent = poll._voted ? 'Update vote' : 'Vote';
-      voteBtn.disabled = !((poll._selectedIndexes || []).length > 0) || pollState.inflight.has(poll.id);
-      voteBtn.addEventListener('click', () => pollSubmitVote(poll.id));
-      actions.appendChild(voteBtn);
-    }
-
-    card.appendChild(actions);
-
-    if (poll._error) {
-      const err = document.createElement('p');
-      err.className = 'poll-card-error';
-      err.textContent = poll._error;
-      card.appendChild(err);
-    }
-
-    return card;
-  }
-
-  function pollRenderInputs(poll) {
-    const container = document.createElement('div');
-    container.className = 'poll-options';
-    const isMulti = poll.poll_type === 'multiple';
-    const selected = new Set(poll._selectedIndexes || []);
-
-    (poll.options || []).forEach((opt, idx) => {
-      const row = document.createElement('label');
-      row.className = 'poll-option-input';
-
-      const input = document.createElement('input');
-      input.type = isMulti ? 'checkbox' : 'radio';
-      input.name = 'poll-' + poll.id;
-      input.value = String(idx);
-      input.checked = selected.has(idx);
-      input.addEventListener('change', () => {
-        const cur = pollState.polls.get(poll.id);
-        if (!cur) return;
-        if (isMulti) {
-          const set = new Set(cur._selectedIndexes || []);
-          if (input.checked) set.add(idx);
-          else set.delete(idx);
-          cur._selectedIndexes = Array.from(set);
-        } else {
-          cur._selectedIndexes = input.checked ? [idx] : [];
-        }
-        cur._error = null;
-        pollState.polls.set(poll.id, cur);
-        pollRenderList();
-      });
-
-      const text = document.createElement('span');
-      text.textContent = String(opt);
-
-      row.appendChild(input);
-      row.appendChild(text);
-      container.appendChild(row);
-    });
-
-    return container;
-  }
-
-  function pollRenderResults(poll) {
-    const container = document.createElement('div');
-    container.className = 'poll-results';
-
-    const counts = poll.option_counts || [];
-    const total = counts.reduce((a, b) => a + (Number(b) || 0), 0);
-
-    if (total === 0) {
-      const empty = document.createElement('div');
-      empty.className = 'poll-results-empty';
-      empty.textContent = 'No votes yet';
-      // Still show the options as 0-bars so users know what the poll is about.
-      (poll.options || []).forEach((opt) => {
-        container.appendChild(pollRenderBar(String(opt), 0, 0));
-      });
-      container.insertBefore(empty, container.firstChild);
-      return container;
-    }
-
-    (poll.options || []).forEach((opt, idx) => {
-      const n = Number(counts[idx] || 0);
-      const pct = total > 0 ? Math.round((n / total) * 100) : 0;
-      container.appendChild(pollRenderBar(String(opt), n, pct));
-    });
-
-    const summary = document.createElement('div');
-    summary.className = 'poll-meta';
-    const voterCount = poll.total_voters != null ? Number(poll.total_voters) : total;
-    summary.textContent = voterCount + ' ' + (voterCount === 1 ? 'voter' : 'voters');
-    container.appendChild(summary);
-
-    return container;
-  }
-
-  function pollRenderBar(label, count, pct) {
-    const wrapper = document.createElement('div');
-    wrapper.className = 'poll-bar';
-
-    const head = document.createElement('div');
-    head.className = 'poll-bar-header';
-    const lblEl = document.createElement('span');
-    lblEl.className = 'poll-bar-label';
-    lblEl.textContent = label;
-    const cnt = document.createElement('span');
-    cnt.className = 'poll-bar-count';
-    cnt.textContent = count + ' (' + pct + '%)';
-    head.appendChild(lblEl);
-    head.appendChild(cnt);
-
-    const track = document.createElement('div');
-    track.className = 'poll-bar-track';
-    const fill = document.createElement('div');
-    fill.className = 'poll-bar-fill';
-    fill.style.width = Math.max(0, Math.min(100, pct)) + '%';
-    track.appendChild(fill);
-
-    wrapper.appendChild(head);
-    wrapper.appendChild(track);
-    return wrapper;
-  }
-
-  async function pollSubmitVote(pollId) {
-    const poll = pollState.polls.get(pollId);
-    if (!poll) return;
-    if (poll.closed_at) return; // Guard: closed
-    if (pollState.inflight.has(pollId)) return;
-
-    const voterIdentity = pollLocalIdentity();
-    if (!voterIdentity) {
-      poll._error = 'Not connected to the call.';
-      pollState.polls.set(pollId, poll);
-      pollRenderList();
-      return;
-    }
-
-    const indexes = (poll._selectedIndexes || []).slice();
-    if (indexes.length === 0) return;
-
-    if (poll.poll_type === 'multiple') {
-      if (indexes.length < 1 || indexes.length > 6) {
-        poll._error = 'Pick between 1 and 6 options.';
-        pollState.polls.set(pollId, poll);
-        pollRenderList();
-        return;
-      }
-    } else if (indexes.length !== 1) {
-      poll._error = 'Pick one option.';
-      pollState.polls.set(pollId, poll);
-      pollRenderList();
-      return;
-    }
-
-    pollState.inflight.add(pollId);
-    poll._error = null;
-    pollState.polls.set(pollId, poll);
-    pollRenderList();
-
-    try {
-      const result = await apiCall('vote_poll', {
-        p_poll_id: pollId,
-        p_voter_identity: voterIdentity,
-        p_option_indexes: indexes,
-      });
-      if (result && result.error) {
-        const cur = pollState.polls.get(pollId) || poll;
-        cur._error = result.error;
-        pollState.polls.set(pollId, cur);
-        pollRenderList();
-        return;
-      }
-      const cur = pollState.polls.get(pollId) || poll;
-      cur._voted = true;
-      cur._error = null;
-      pollState.polls.set(pollId, cur);
-      // Fan out to other clients + refetch counts for ourselves.
-      await pollPublishDataPacket({ type: 'poll_vote_update', pollId });
-      await pollFetchResults(pollId);
-    } catch (e) {
-      console.error('vote_poll failed:', e);
-      const cur = pollState.polls.get(pollId) || poll;
-      cur._error = 'Failed to submit vote.';
-      pollState.polls.set(pollId, cur);
-      pollRenderList();
-    } finally {
-      pollState.inflight.delete(pollId);
-    }
-  }
-
-  async function pollClosePoll(pollId) {
-    const poll = pollState.polls.get(pollId);
-    if (!poll) return;
-    if (pollState.inflight.has(pollId)) return;
-    const identity = pollLocalIdentity();
-    if (!identity) return;
-
-    pollState.inflight.add(pollId);
-    try {
-      const result = await apiCall('close_poll', {
-        p_poll_id: pollId,
-        p_closer_identity: identity,
-      });
-      if (result && result.error) {
-        const cur = pollState.polls.get(pollId) || poll;
-        cur._error = result.error;
-        pollState.polls.set(pollId, cur);
-        pollRenderList();
-        return;
-      }
-      // Refetch full results (which include closed_at + counts).
-      await pollFetchResults(pollId);
-      await pollPublishDataPacket({ type: 'poll_closed', pollId });
-    } catch (e) {
-      console.error('close_poll failed:', e);
-      const cur = pollState.polls.get(pollId) || poll;
-      cur._error = 'Failed to close poll.';
-      pollState.polls.set(pollId, cur);
-      pollRenderList();
-    } finally {
-      pollState.inflight.delete(pollId);
-    }
-  }
-
-  // --- Create-poll modal ---
-
-  function pollOpenCreateModal() {
-    if (!state.room) {
-      // Guard: can't create a poll before the room is connected.
-      console.warn('poll: cannot create before connected');
-      return;
-    }
-    $('poll-question-input').value = '';
-    const singleRadio = document.querySelector('input[name="poll-type"][value="single"]');
-    if (singleRadio) singleRadio.checked = true;
-    $('poll-create-error').classList.add('hidden');
-    $('poll-create-error').textContent = '';
-
-    // Reset to 2 empty option rows.
-    const list = $('poll-options-list');
-    list.innerHTML = '';
-    pollAddOptionRow('');
-    pollAddOptionRow('');
-    pollUpdateCreateValidity();
-
-    $('poll-create-modal').classList.remove('hidden');
-    setTimeout(() => $('poll-question-input').focus(), 50);
-  }
-
-  function pollCloseCreateModal() {
-    $('poll-create-modal').classList.add('hidden');
-  }
-
-  function pollAddOptionRow(initial) {
-    const list = $('poll-options-list');
-    const existing = list.querySelectorAll('.poll-option-row').length;
-    if (existing >= 6) return;
-
-    const row = document.createElement('div');
-    row.className = 'poll-option-row';
-
-    const input = document.createElement('input');
-    input.type = 'text';
-    input.className = 'poll-input poll-option-text';
-    input.placeholder = 'Option ' + (existing + 1);
-    input.maxLength = 200;
-    input.value = initial || '';
-    input.addEventListener('input', pollUpdateCreateValidity);
-
-    const remove = document.createElement('button');
-    remove.type = 'button';
-    remove.className = 'poll-option-remove';
-    remove.textContent = '×';
-    remove.title = 'Remove option';
-    remove.addEventListener('click', () => {
-      // Must keep at least 2 rows.
-      const rows = list.querySelectorAll('.poll-option-row');
-      if (rows.length <= 2) return;
-      row.remove();
-      pollUpdateCreateValidity();
-      pollUpdateAddOptionButton();
-    });
-
-    row.appendChild(input);
-    row.appendChild(remove);
-    list.appendChild(row);
-    pollUpdateAddOptionButton();
-  }
-
-  function pollUpdateAddOptionButton() {
-    const count = $('poll-options-list').querySelectorAll('.poll-option-row').length;
-    const btn = $('btn-add-option');
-    if (!btn) return;
-    btn.disabled = count >= 6;
-  }
-
-  function pollCollectCreateValues() {
-    const question = $('poll-question-input').value.trim();
-    const type = (document.querySelector('input[name="poll-type"]:checked') || {}).value || 'single';
-    const options = Array.from($('poll-options-list').querySelectorAll('.poll-option-text'))
-      .map((i) => i.value.trim())
-      .filter((v) => v.length > 0);
-    return { question, type, options };
-  }
-
-  function pollUpdateCreateValidity() {
-    const { question, options } = pollCollectCreateValues();
-    const valid = question.length > 0 && options.length >= 2;
-    $('btn-submit-create-poll').disabled = !valid;
-  }
-
-  async function pollSubmitCreate() {
-    const { question, type, options } = pollCollectCreateValues();
-    const roomName = pollRoomName();
-    const creatorIdentity = pollLocalIdentity();
-    const errEl = $('poll-create-error');
-    errEl.classList.add('hidden');
-    errEl.textContent = '';
-
-    if (!roomName || !creatorIdentity) {
-      errEl.textContent = 'Not connected to the call.';
-      errEl.classList.remove('hidden');
-      return;
-    }
-    if (!question) {
-      errEl.textContent = 'Question is required.';
-      errEl.classList.remove('hidden');
-      return;
-    }
-    if (options.length < 2) {
-      errEl.textContent = 'Add at least 2 options.';
-      errEl.classList.remove('hidden');
-      return;
-    }
-    if (options.length > 6) {
-      errEl.textContent = 'Maximum 6 options.';
-      errEl.classList.remove('hidden');
-      return;
-    }
-
-    const submitBtn = $('btn-submit-create-poll');
-    submitBtn.disabled = true;
-
-    try {
-      const result = await apiCall('create_poll', {
-        p_room_name: roomName,
-        p_creator_identity: creatorIdentity,
-        p_question: question,
-        p_options: options,
-        p_poll_type: type,
-      });
-
-      if (result && result.error) {
-        errEl.textContent = result.error;
-        errEl.classList.remove('hidden');
-        submitBtn.disabled = false;
-        return;
-      }
-
-      // Optimistic: prepend to local cache.
-      if (result && result.id) {
-        pollState.polls.set(result.id, {
-          id: result.id,
-          question: result.question || question,
-          options: result.options || options,
-          poll_type: result.poll_type || type,
-          room_name: result.room_name || roomName,
-          creator_identity: result.creator_identity || creatorIdentity,
-          created_at: result.created_at || new Date().toISOString(),
-          option_counts: new Array(options.length).fill(0),
-          total_voters: 0,
-          _selectedIndexes: [],
-          _voted: false,
-        });
-        pollRenderList();
-
-        // Fan out to other clients so they refetch the active list.
-        await pollPublishDataPacket({ type: 'poll_new', pollId: result.id });
-      } else {
-        // Fallback: refetch full list.
-        await pollListActive();
-      }
-
-      pollCloseCreateModal();
-    } catch (e) {
-      console.error('create_poll failed:', e);
-      errEl.textContent = 'Failed to create poll.';
-      errEl.classList.remove('hidden');
-      submitBtn.disabled = false;
-    }
-  }
-
-  function pollHandleDataPacket(msg) {
-    if (!msg || !msg.type) return;
-    if (msg.type === 'poll_new') {
-      pollListActive();
-    } else if (msg.type === 'poll_vote_update') {
-      if (msg.pollId) pollFetchResults(msg.pollId);
-    } else if (msg.type === 'poll_closed') {
-      if (!msg.pollId) return;
-      // Cache-through: stamp closed_at locally IMMEDIATELY so the poll is
-      // retained through the next pollListActive() refetch (which filters on
-      // `!card.closed_at`). Without this, there's a window where a refetch
-      // can race pollFetchResults() and drop the now-closed poll from the
-      // map — leaving a ghost in state or silently losing the entry if the
-      // drawer was closed.
-      //
-      // pollFetchResults() below then pulls authoritative final counts +
-      // server-side closed_at; the client stamp is just a retention marker.
-      const existing = pollState.polls.get(msg.pollId);
-      if (existing && !existing.closed_at) {
-        pollState.polls.set(msg.pollId, {
-          ...existing,
-          closed_at: new Date().toISOString(),
-        });
-        if (pollState.panelOpen) pollRenderList();
-      }
-      pollFetchResults(msg.pollId);
-    }
-  }
-
-  function setupPollControls() {
-    const btnPolls = $('btn-polls');
-    if (btnPolls) btnPolls.addEventListener('click', pollPanelToggle);
-    const btnClose = $('btn-close-polls');
-    if (btnClose) btnClose.addEventListener('click', pollPanelClose);
-    const btnOpenCreate = $('btn-open-create-poll');
-    if (btnOpenCreate) btnOpenCreate.addEventListener('click', pollOpenCreateModal);
-    const btnCancelCreate = $('btn-cancel-create-poll');
-    if (btnCancelCreate) btnCancelCreate.addEventListener('click', pollCloseCreateModal);
-    const btnCloseCreate = $('btn-close-create-poll');
-    if (btnCloseCreate) btnCloseCreate.addEventListener('click', pollCloseCreateModal);
-    const btnSubmitCreate = $('btn-submit-create-poll');
-    if (btnSubmitCreate) btnSubmitCreate.addEventListener('click', pollSubmitCreate);
-    const btnAddOption = $('btn-add-option');
-    if (btnAddOption) btnAddOption.addEventListener('click', () => pollAddOptionRow(''));
-    const questionInput = $('poll-question-input');
-    if (questionInput) questionInput.addEventListener('input', pollUpdateCreateValidity);
-    // Dismiss modal on backdrop click.
-    const backdrop = document.querySelector('.poll-create-backdrop');
-    if (backdrop) backdrop.addEventListener('click', pollCloseCreateModal);
   }
 
   // ------------------------------------
@@ -3730,17 +1253,13 @@
       return;
     }
 
-    // Dev-only: ?forceHost=1 lights up the host-only controls for testing.
-    // Real host flow: ?host=<host_token> grants creator credentials without
-    // authentication. The host_token is minted server-side at
-    // create_call_link time (see call_links.host_token column).
-    try {
-      const qp = new URLSearchParams(window.location.search);
-      if (qp.get('forceHost') === '1') state.isHost = true;
-      state.hostToken = qp.get('host') || null;
-    } catch (_) { /* noop */ }
-
     state.token = path;
+
+    // Host-scoped URL: ?host=<host_token> grants host privileges without auth.
+    // Only the creator should have this URL; anyone holding it can end the call.
+    const params = new URLSearchParams(window.location.search);
+    state.hostToken = params.get('host') || null;
+
     setupCallControls();
 
     // Show loading while we check if the link exists
@@ -3759,13 +1278,971 @@
         return;
       }
 
+      if (data.is_ended) {
+        showError('Meeting Ended', 'The host has ended this meeting.');
+        return;
+      }
+
       state.callLink = data;
+
+      // Host path: auto-identify, skip name prompt, join straight through.
+      if (state.hostToken) {
+        await handleHostJoin();
+        return;
+      }
+
       renderJoinScreen(data);
     } catch (err) {
       console.error('Init error:', err);
       showError('Connection Error', 'Could not reach the server. Please check your internet connection and try again.');
     }
   }
+
+  async function handleHostJoin() {
+    try {
+      showScreen('loading');
+      const data = await joinCallAsHost(state.token, state.hostToken);
+      if (data.error) {
+        showError('Host Link Invalid', data.error);
+        return;
+      }
+      state.joinData = data;
+      state.isHost = !!data.is_host;
+      await startCall(data);
+    } catch (err) {
+      console.error('Host join error:', err);
+      showError('Connection Error', 'Could not start the meeting as host. Please check your internet connection and try again.');
+    }
+  }
+
+  // ------------------------------------
+  // Breakouts — API helpers
+  // ------------------------------------
+  async function rpcCreateBreakoutSession(opts) {
+    return apiCall('create_breakout_session', {
+      p_parent_room: opts.parentRoom,
+      p_creator_identity: opts.creatorIdentity,
+      p_duration_seconds: opts.durationSeconds,
+      p_room_count: opts.roomCount,
+      p_auto_assign: opts.autoAssign,
+      p_assignments: opts.assignments || [],
+      // Disambiguate PGRST203 — two overloads of create_breakout_session
+      // exist on the server (6-arg legacy vs 7-arg with capacity limit).
+      // Always send the 7th so PostgREST picks the newer definition.
+      p_max_participants_per_room: null,
+    });
+  }
+
+  async function rpcAutoAssignBreakoutParticipants(sessionId, identities) {
+    return apiCall('auto_assign_breakout_participants', {
+      p_session_id: sessionId,
+      p_participant_identities: identities,
+    });
+  }
+
+  async function rpcJoinBreakoutRoom(sessionId, roomId, participantIdentity) {
+    return apiCall('join_breakout_room', {
+      p_session_id: sessionId,
+      p_room_id: roomId,
+      p_participant_identity: participantIdentity,
+    });
+  }
+
+  async function rpcMoveParticipant(sessionId, participantIdentity, targetRoomId, moverIdentity) {
+    return apiCall('move_participant_to_breakout', {
+      p_session_id: sessionId,
+      p_participant_identity: participantIdentity,
+      p_target_room_id: targetRoomId,
+      p_mover_identity: moverIdentity,
+    });
+  }
+
+  async function rpcBroadcastToBreakouts(sessionId, message, senderIdentity) {
+    return apiCall('broadcast_to_breakouts', {
+      p_session_id: sessionId,
+      p_message: message,
+      p_sender_identity: senderIdentity,
+    });
+  }
+
+  async function rpcEndBreakoutSession(sessionId, enderIdentity) {
+    return apiCall('end_breakout_session', {
+      p_session_id: sessionId,
+      p_ender_identity: enderIdentity,
+    });
+  }
+
+  async function rpcRequestBreakoutHelp(sessionId, roomId, requesterIdentity) {
+    return apiCall('request_breakout_help', {
+      p_session_id: sessionId,
+      p_room_id: roomId,
+      p_requester_identity: requesterIdentity,
+    });
+  }
+
+  async function rpcResolveHelpRequest(helpId, resolverIdentity) {
+    return apiCall('resolve_help_request', {
+      p_help_id: helpId,
+      p_resolver_identity: resolverIdentity,
+    });
+  }
+
+  async function rpcGetBreakoutSession(parentRoom) {
+    return apiCall('get_breakout_session', { p_parent_room: parentRoom });
+  }
+
+  // ------------------------------------
+  // Breakouts — Control visibility
+  // ------------------------------------
+  function updateBreakoutButtonVisibility() {
+    const btn = $('btn-breakouts');
+    if (!btn) return;
+    // Show to host always (create + manage). Participants get no button —
+    // they see the in-breakout banner instead when they're assigned.
+    if (state.isHost) {
+      btn.classList.remove('hidden');
+    } else {
+      btn.classList.add('hidden');
+    }
+  }
+
+  function setBreakoutsBadge(count) {
+    const badge = $('breakouts-badge');
+    if (!badge) return;
+    if (count > 0) {
+      badge.textContent = String(count);
+      badge.classList.remove('hidden');
+    } else {
+      badge.classList.add('hidden');
+    }
+  }
+
+  // ------------------------------------
+  // Breakouts — Room-switch helper
+  // ------------------------------------
+  // Disconnect from the current LiveKit room and connect to a new one with
+  // a fresh token, preserving mic/camera state across the transition.
+  async function switchRoom(serverUrl, token, reason) {
+    if (state.isSwitchingRoom) {
+      console.warn('switchRoom: already switching, ignoring reason=' + reason);
+      return { ok: false, error: 'already_switching' };
+    }
+    if (!state.room) {
+      return { ok: false, error: 'no_room' };
+    }
+    state.isSwitchingRoom = true;
+    const LivekitClient = window.LivekitClient;
+
+    // Snapshot mic/camera state before teardown.
+    const wasMicMuted = state.isMicMuted;
+    const wasVideoOff = state.isVideoOff;
+
+    try {
+      try { state.room.disconnect(); } catch (e) { /* ignore */ }
+      state.room = null;
+
+      const newRoom = new LivekitClient.Room({
+        adaptiveStream: true,
+        dynacast: true,
+        videoCaptureDefaults: {
+          resolution: LivekitClient.VideoPresets.h720.resolution,
+        },
+      });
+
+      state.room = newRoom;
+      setupRoomEvents(newRoom);
+      await newRoom.connect(serverUrl, token);
+
+      // Re-apply mic/camera state. For audio-only calls, camera is no-op.
+      const isVideo = state.callLink && state.callLink.call_type === 'video';
+      await newRoom.localParticipant.setMicrophoneEnabled(!wasMicMuted);
+      if (isVideo) {
+        await newRoom.localParticipant.setCameraEnabled(!wasVideoOff);
+      }
+      state.isMicMuted = wasMicMuted;
+      state.isVideoOff = isVideo ? wasVideoOff : true;
+      // Identity stays the same — generate_livekit_token encoded it.
+      state.myIdentity = newRoom.localParticipant.identity || state.myIdentity;
+
+      updateControlButtons();
+      renderParticipants();
+      return { ok: true };
+    } catch (err) {
+      console.error('switchRoom failed:', err);
+      return { ok: false, error: err.message || String(err) };
+    } finally {
+      state.isSwitchingRoom = false;
+    }
+  }
+
+  // ------------------------------------
+  // Breakouts — DataPacket handlers
+  // ------------------------------------
+  async function handleBreakoutAssignPacket(msg) {
+    // Ignore if we're currently switching already (race w/ stale packet).
+    if (state.isSwitchingRoom) return;
+
+    const serverUrl = msg.server_url;
+    const token = msg.token;
+    const roomName = msg.room_name;
+    if (!serverUrl || !token || !roomName) {
+      console.warn('breakout_assign: missing fields', msg);
+      return;
+    }
+
+    // Show takeover modal (non-blocking) then switch.
+    showBreakoutTakeover(msg.room_label || roomName, 3);
+
+    // Wait ~1.2s so the user sees the notice; then switch.
+    await new Promise((r) => setTimeout(r, 1200));
+
+    const result = await switchRoom(serverUrl, token, 'breakout_assign');
+    hideBreakoutTakeover();
+
+    if (result.ok) {
+      state.currentBreakout = {
+        sessionId: msg.session_id || '',
+        roomId: msg.room_id || '',
+        roomName: roomName,
+        roomLabel: msg.room_label || roomName,
+        closesAt: msg.closes_at ? new Date(msg.closes_at) : null,
+      };
+      showBreakoutBanner();
+      startBreakoutCountdown();
+      startBreakoutSessionPoll();
+    } else {
+      showCallToast('Could not move to breakout: ' + (result.error || 'unknown'), '⚠');
+    }
+  }
+
+  async function handleBreakoutEndedPacket(msg) {
+    if (!state.currentBreakout) {
+      // Packet arrived but we aren't in a breakout — ignore.
+      return;
+    }
+    const reason = msg.reason || 'timer_expired';
+    state.kickedToMainReason = reason;
+
+    // Stop banner + polls; session is over.
+    stopBreakoutCountdown();
+    stopBreakoutSessionPoll();
+    hideBreakoutBanner();
+    state.currentBreakout = null;
+
+    showCallToast(
+      reason === 'host_ended'
+        ? 'Host ended breakouts. Returning to main room...'
+        : 'Breakout time is up. Returning to main room...',
+      '↩',
+    );
+
+    // Re-mint a main-room token. Guests get a new guest identity (acceptable
+    // tradeoff — the breakout session is over). Hosts reuse the host_token.
+    try {
+      const mainRoom = await mintMainRoomToken();
+      if (!mainRoom) {
+        throw new Error('Could not mint main-room token');
+      }
+      const result = await switchRoom(
+        mainRoom.server_url,
+        mainRoom.token,
+        'breakout_ended',
+      );
+      if (!result.ok) {
+        throw new Error(result.error || 'switch failed');
+      }
+    } catch (e) {
+      console.error('return-to-main after breakout_ended failed:', e);
+      showCallToast('Could not return to main room. Try Rejoin.', '⚠');
+      // Fall back to end screen — user can click Rejoin.
+      endCall();
+    }
+  }
+
+  // Detect "I have an active assignment in a running session" right after
+  // joining the main room and, if so, jump straight into the breakout. Used
+  // when a host refreshes the page mid-breakout. Guests are skipped: every
+  // call to join_call_as_guest mints a new guest-<hex>, so the previous
+  // assignment row is orphaned and can't be resolved back to "me".
+  async function maybeRehydrateBreakoutAssignment() {
+    if (!state.parentRoomName || !state.myIdentity) return;
+    if (!state.isHost) return; // guests have unstable identities
+    let session;
+    try {
+      session = await rpcGetBreakoutSession(state.parentRoomName);
+    } catch (e) {
+      return; // transient; nothing to rehydrate
+    }
+    if (!session || session.error) return;
+    if (!session.session) return;
+    const status = session.session.status;
+    if (status !== 'open' && status !== 'scheduled') return;
+
+    const myAssignment = (session.assignments || [])
+      .find((a) => a.participant_identity === state.myIdentity);
+    if (!myAssignment) return;
+
+    const room = (session.rooms || []).find((r) => r.id === myAssignment.room_id);
+    if (!room) return;
+
+    // Mint a breakout token and switch in. No takeover modal — this is a
+    // silent rehydrate, user just lands in the room they already belonged to.
+    try {
+      const res = await rpcJoinBreakoutRoom(
+        session.session.id,
+        room.id,
+        state.myIdentity,
+      );
+      if (!res || res.error || !res.token) return;
+      const serverUrl = res.server_url || (state.joinData && state.joinData.server_url);
+      const result = await switchRoom(serverUrl, res.token, 'rehydrate_breakout');
+      if (!result.ok) return;
+      state.currentBreakout = {
+        sessionId: session.session.id,
+        roomId: room.id,
+        roomName: res.room_name || room.room_name,
+        roomLabel: room.label,
+        closesAt: session.session.closes_at
+          ? new Date(session.session.closes_at)
+          : null,
+      };
+      showBreakoutBanner();
+      startBreakoutCountdown();
+      startBreakoutSessionPoll();
+    } catch (e) {
+      console.debug('rehydrate breakout failed:', e && e.message);
+    }
+  }
+
+  async function mintMainRoomToken() {
+    if (state.hostToken) {
+      const data = await joinCallAsHost(state.token, state.hostToken);
+      if (data && !data.error && data.token) return data;
+    }
+    if (state.lastGuestName) {
+      const data = await joinCallAsGuest(state.token, state.lastGuestName);
+      if (data && !data.error && data.token && data.admission_status !== 'waiting') {
+        return data;
+      }
+    }
+    return null;
+  }
+
+  // ------------------------------------
+  // Breakouts — Takeover modal + banner
+  // ------------------------------------
+  function showBreakoutTakeover(roomLabel, countSec) {
+    const el = $('breakout-takeover');
+    const roomEl = $('breakout-takeover-room');
+    const countEl = $('breakout-takeover-count');
+    if (!el || !roomEl || !countEl) return;
+    roomEl.textContent = roomLabel;
+    let remaining = countSec;
+    countEl.textContent = String(remaining);
+    el.classList.remove('hidden');
+    const iv = setInterval(() => {
+      remaining -= 1;
+      if (remaining <= 0) {
+        clearInterval(iv);
+        return;
+      }
+      countEl.textContent = String(remaining);
+    }, 1000);
+    // Auto-clear the interval when hideTakeover runs.
+    el._iv = iv;
+  }
+
+  function hideBreakoutTakeover() {
+    const el = $('breakout-takeover');
+    if (!el) return;
+    if (el._iv) { try { clearInterval(el._iv); } catch (_) {} el._iv = null; }
+    el.classList.add('hidden');
+  }
+
+  function showBreakoutBanner() {
+    const el = $('breakout-banner');
+    if (!el || !state.currentBreakout) return;
+    $('breakout-banner-room').textContent = state.currentBreakout.roomLabel;
+    updateBreakoutBannerCountdown();
+    el.classList.remove('hidden');
+  }
+
+  function hideBreakoutBanner() {
+    const el = $('breakout-banner');
+    if (el) el.classList.add('hidden');
+  }
+
+  function updateBreakoutBannerCountdown() {
+    if (!state.currentBreakout || !state.currentBreakout.closesAt) return;
+    const remaining = state.currentBreakout.closesAt.getTime() - Date.now();
+    const secs = Math.max(0, Math.floor(remaining / 1000));
+    const m = Math.floor(secs / 60);
+    const s = secs % 60;
+    const el = $('breakout-banner-time');
+    if (el) el.textContent = String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
+    // Also the host panel active countdown
+    const hostEl = $('breakout-active-time');
+    if (hostEl) hostEl.textContent = String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
+  }
+
+  function startBreakoutCountdown() {
+    stopBreakoutCountdown();
+    state.breakoutCountdownTimer = setInterval(updateBreakoutBannerCountdown, 1000);
+  }
+
+  function stopBreakoutCountdown() {
+    if (state.breakoutCountdownTimer) {
+      clearInterval(state.breakoutCountdownTimer);
+      state.breakoutCountdownTimer = null;
+    }
+  }
+
+  // ------------------------------------
+  // Breakouts — Session poll
+  // ------------------------------------
+  // Polls get_breakout_session every 5s. Used by host (panel open or session
+  // active) and participant (inside a breakout, to pick up broadcast messages
+  // and detect session close).
+  function startBreakoutSessionPoll() {
+    stopBreakoutSessionPoll();
+    state.breakoutPollTimer = setInterval(pollBreakoutSession, 5000);
+    pollBreakoutSession();
+  }
+
+  function stopBreakoutSessionPoll() {
+    if (state.breakoutPollTimer) {
+      clearInterval(state.breakoutPollTimer);
+      state.breakoutPollTimer = null;
+    }
+  }
+
+  async function pollBreakoutSession() {
+    if (!state.parentRoomName) return;
+    try {
+      const data = await rpcGetBreakoutSession(state.parentRoomName);
+      if (data && !data.error) {
+        state.breakoutSession = data.session ? data : null;
+        // Broadcast toast dedup
+        if (state.breakoutSession && state.breakoutSession.session) {
+          const bcastAt = state.breakoutSession.session.broadcast_at;
+          const bcastMsg = state.breakoutSession.session.broadcast_message;
+          if (bcastAt && bcastMsg && bcastAt !== state.lastBroadcastAt) {
+            state.lastBroadcastAt = bcastAt;
+            // Only surface on participants (hosts see their own send).
+            if (!state.isHost && state.currentBreakout) {
+              showCallToast('Host: ' + bcastMsg, '📢');
+            }
+          }
+        }
+        // Host-side unresolved help request badge
+        if (state.isHost) {
+          const help = (state.breakoutSession && state.breakoutSession.help_requests) || [];
+          setBreakoutsBadge(help.length);
+          if (state.hostPanelOpen) renderHostPanel();
+        }
+      }
+    } catch (e) {
+      console.debug('pollBreakoutSession:', e.message);
+    }
+  }
+
+  // ------------------------------------
+  // Breakouts — Participant help request
+  // ------------------------------------
+  async function participantRequestHelp() {
+    if (!state.currentBreakout) return;
+    const now = Date.now();
+    if (state.helpRequestPendingUntil > now) return; // 10s cooldown
+    state.helpRequestPendingUntil = now + 10000;
+    const btn = $('btn-breakout-help');
+    if (btn) btn.disabled = true;
+    try {
+      await rpcRequestBreakoutHelp(
+        state.currentBreakout.sessionId,
+        state.currentBreakout.roomId,
+        state.myIdentity,
+      );
+      showCallToast('Help request sent', '✓');
+    } catch (e) {
+      console.error('requestHelp failed:', e);
+      showCallToast('Could not send help request', '⚠');
+    } finally {
+      setTimeout(() => {
+        const b = $('btn-breakout-help');
+        if (b) b.disabled = false;
+      }, 10000);
+    }
+  }
+
+  // ------------------------------------
+  // Breakouts — Host panel
+  // ------------------------------------
+  function toggleBreakoutHostPanel() {
+    if (state.hostPanelOpen) hideBreakoutHostPanel();
+    else showBreakoutHostPanel();
+  }
+
+  function showBreakoutHostPanel() {
+    const el = $('breakout-host-panel');
+    if (!el) return;
+    state.hostPanelOpen = true;
+    el.classList.remove('hidden');
+    startBreakoutSessionPoll();
+    renderHostPanel();
+  }
+
+  function hideBreakoutHostPanel() {
+    const el = $('breakout-host-panel');
+    if (!el) return;
+    state.hostPanelOpen = false;
+    el.classList.add('hidden');
+    // Keep polling if there's still an active session (for badge).
+    if (!state.breakoutSession || !state.breakoutSession.session) {
+      stopBreakoutSessionPoll();
+    }
+  }
+
+  // Re-render the manual-assignment picker list from current remote-participant
+  // set. Shown only when mode=='manual'. Preserves prior selections by reading
+  // the existing DOM's dataset values before rebuilding.
+  function renderManualAssignPickers() {
+    const list = $('breakout-manual-list');
+    const modeSel = $('breakout-assign-mode');
+    if (!list || !modeSel) return;
+    const mode = modeSel.value;
+    if (mode !== 'manual') {
+      list.classList.add('hidden');
+      list.innerHTML = '';
+      return;
+    }
+
+    // Preserve existing selections.
+    const prior = {};
+    list.querySelectorAll('.breakout-manual-picker').forEach((sel) => {
+      if (sel.dataset.identity) prior[sel.dataset.identity] = sel.value;
+    });
+
+    const roomCount = parseInt($('breakout-room-count').value, 10) || 2;
+    const participants = [];
+    if (state.room) {
+      state.room.remoteParticipants.forEach((p) => {
+        participants.push({ identity: p.identity, name: p.name || p.identity });
+      });
+    }
+
+    list.innerHTML = '';
+    if (participants.length === 0) {
+      const empty = document.createElement('p');
+      empty.className = 'breakout-manual-empty';
+      empty.textContent = 'No other participants in the call yet.';
+      list.appendChild(empty);
+      list.classList.remove('hidden');
+      return;
+    }
+
+    const header = document.createElement('div');
+    header.className = 'breakout-manual-header';
+    header.textContent = 'Assign participants';
+    list.appendChild(header);
+
+    participants.forEach((p) => {
+      const row = document.createElement('div');
+      row.className = 'breakout-manual-row';
+      const nameEl = document.createElement('span');
+      nameEl.className = 'breakout-manual-name';
+      nameEl.textContent = shortIdentity(p.identity);
+      row.appendChild(nameEl);
+
+      const sel = document.createElement('select');
+      sel.className = 'breakout-manual-picker';
+      sel.dataset.identity = p.identity;
+      const none = document.createElement('option');
+      none.value = '0';
+      none.textContent = 'None';
+      sel.appendChild(none);
+      for (let i = 1; i <= roomCount; i++) {
+        const opt = document.createElement('option');
+        opt.value = String(i);
+        opt.textContent = 'Room ' + i;
+        sel.appendChild(opt);
+      }
+      // Restore prior value if still within range.
+      const priorVal = parseInt(prior[p.identity], 10);
+      if (priorVal >= 1 && priorVal <= roomCount) {
+        sel.value = String(priorVal);
+      } else {
+        sel.value = '0';
+      }
+      row.appendChild(sel);
+      list.appendChild(row);
+    });
+
+    list.classList.remove('hidden');
+  }
+
+  function renderHostPanel() {
+    const createForm = $('breakout-create-form');
+    const active = $('breakout-active');
+    const hasActive =
+      state.breakoutSession &&
+      state.breakoutSession.session &&
+      ['open', 'scheduled'].includes(state.breakoutSession.session.status);
+
+    if (hasActive) {
+      createForm.classList.add('hidden');
+      active.classList.remove('hidden');
+      renderActiveSession();
+    } else {
+      createForm.classList.remove('hidden');
+      active.classList.add('hidden');
+      renderManualAssignPickers();
+    }
+  }
+
+  function renderActiveSession() {
+    const sess = state.breakoutSession.session;
+    const rooms = state.breakoutSession.rooms || [];
+    const assignments = state.breakoutSession.assignments || [];
+    const help = state.breakoutSession.help_requests || [];
+
+    if (sess.closes_at) {
+      state.currentBreakout = state.currentBreakout || {};
+      state.currentBreakout.closesAt = new Date(sess.closes_at);
+      updateBreakoutBannerCountdown();
+    }
+
+    // Rooms grid with participant counts
+    const list = $('breakout-rooms-list');
+    list.innerHTML = '';
+    rooms.forEach((r) => {
+      const card = document.createElement('div');
+      card.className = 'breakout-room-card';
+
+      const head = document.createElement('div');
+      head.className = 'breakout-room-card-head';
+      const assigned = assignments.filter((a) => a.room_id === r.id);
+      head.innerHTML =
+        '<span>' + escapeHtml(r.label) + '</span>' +
+        '<span class="breakout-room-card-count">' + assigned.length + ' people</span>';
+      card.appendChild(head);
+
+      if (assigned.length > 0) {
+        const names = document.createElement('div');
+        names.className = 'breakout-room-card-assignees';
+        names.textContent = assigned
+          .map((a) => shortIdentity(a.participant_identity))
+          .join(', ');
+        card.appendChild(names);
+      }
+
+      const actions = document.createElement('div');
+      actions.className = 'breakout-room-card-actions';
+      const visitBtn = document.createElement('button');
+      visitBtn.className = 'btn btn-secondary btn-small';
+      visitBtn.textContent = 'Visit';
+      visitBtn.addEventListener('click', () => hostVisitRoom(r));
+      actions.appendChild(visitBtn);
+      card.appendChild(actions);
+
+      list.appendChild(card);
+    });
+
+    // Help requests block
+    const helpBlock = $('breakout-help-block');
+    const helpList = $('breakout-help-list');
+    if (help.length > 0) {
+      helpBlock.classList.remove('hidden');
+      helpList.innerHTML = '';
+      help.forEach((h) => {
+        const item = document.createElement('div');
+        item.className = 'breakout-help-item';
+        item.innerHTML =
+          '<span>' + escapeHtml(shortIdentity(h.requester_identity)) + '</span>' +
+          '<span class="breakout-help-actions"></span>';
+        const actions = item.querySelector('.breakout-help-actions');
+        const roomForHelp = rooms.find((r) => r.id === h.room_id);
+        if (roomForHelp) {
+          const visitBtn = document.createElement('button');
+          visitBtn.className = 'btn btn-secondary btn-small';
+          visitBtn.textContent = 'Visit';
+          visitBtn.addEventListener('click', () => hostVisitRoom(roomForHelp));
+          actions.appendChild(visitBtn);
+        }
+        const resolveBtn = document.createElement('button');
+        resolveBtn.className = 'btn btn-ghost btn-small';
+        resolveBtn.textContent = 'Dismiss';
+        resolveBtn.addEventListener('click', () => hostResolveHelp(h.id));
+        actions.appendChild(resolveBtn);
+        helpList.appendChild(item);
+      });
+    } else {
+      helpBlock.classList.add('hidden');
+    }
+  }
+
+  async function hostCreateBreakouts() {
+    const errorEl = $('breakout-create-error');
+    errorEl.classList.add('hidden');
+
+    const roomCount = parseInt($('breakout-room-count').value, 10);
+    const durationMin = parseInt($('breakout-duration').value, 10);
+    const mode = $('breakout-assign-mode').value; // 'auto' | 'manual'
+
+    if (!(roomCount >= 2 && roomCount <= 20)) {
+      errorEl.textContent = 'Room count must be 2-20';
+      errorEl.classList.remove('hidden');
+      return;
+    }
+    if (!(durationMin >= 1 && durationMin <= 120)) {
+      errorEl.textContent = 'Duration must be 1-120 minutes';
+      errorEl.classList.remove('hidden');
+      return;
+    }
+    if (!state.creatorIdentity) {
+      errorEl.textContent = 'Host identity missing — cannot create';
+      errorEl.classList.remove('hidden');
+      return;
+    }
+
+    // Build manual-assignment list from the per-participant pickers rendered
+    // by renderManualAssignPickers(). Entries with value "" (None) stay
+    // in the main room. Picker values are 1-based room indexes.
+    const manualAssignments = [];
+    if (mode === 'manual') {
+      const pickers = document.querySelectorAll('.breakout-manual-picker');
+      pickers.forEach((sel) => {
+        const identity = sel.dataset.identity;
+        const roomIndex = parseInt(sel.value, 10);
+        if (identity && roomIndex >= 1 && roomIndex <= roomCount) {
+          manualAssignments.push({
+            participant_identity: identity,
+            room_index: roomIndex,
+          });
+        }
+      });
+    }
+
+    const btn = $('btn-breakout-create');
+    btn.disabled = true;
+    btn.textContent = 'Creating...';
+    try {
+      const created = await rpcCreateBreakoutSession({
+        parentRoom: state.parentRoomName,
+        creatorIdentity: state.creatorIdentity,
+        durationSeconds: durationMin * 60,
+        roomCount: roomCount,
+        autoAssign: mode === 'auto',
+        assignments: manualAssignments,
+      });
+      if (created.error) throw new Error(created.error);
+
+      const sessionId = created.session.id;
+      const serverUrl = state.joinData && state.joinData.server_url;
+      const closesAt = created.session.closes_at || null;
+
+      // Per-participant tokens to publish (manual assigns from create + auto).
+      const tokens = Array.isArray(created.tokens) ? [...created.tokens] : [];
+
+      if (mode === 'auto') {
+        const participants = getRemoteParticipantIdentities();
+        if (participants.length > 0) {
+          const res = await rpcAutoAssignBreakoutParticipants(sessionId, participants);
+          if (res && res.error) throw new Error(res.error);
+          if (res && Array.isArray(res.assignments)) {
+            tokens.push(...res.assignments);
+          }
+        }
+      }
+
+      // Publish per-participant breakout_assign packets.
+      const rooms = created.rooms || [];
+      const labelByName = {};
+      rooms.forEach((r) => { labelByName[r.room_name] = r.label; });
+      for (const t of tokens) {
+        if (!t || !t.participant_identity || t.participant_identity === state.myIdentity) {
+          continue; // skip host self-assignments
+        }
+        await publishBreakoutAssignPacket({
+          targetIdentity: t.participant_identity,
+          sessionId: sessionId,
+          serverUrl: serverUrl,
+          token: t.token,
+          roomName: t.room_name,
+          roomLabel: labelByName[t.room_name] || t.room_name,
+          closesAt: closesAt,
+        });
+      }
+
+      showCallToast('Breakouts started', '✓');
+      await pollBreakoutSession();
+      renderHostPanel();
+    } catch (e) {
+      console.error('hostCreateBreakouts failed:', e);
+      errorEl.textContent = 'Could not start breakouts: ' + (e.message || e);
+      errorEl.classList.remove('hidden');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Start breakouts';
+    }
+  }
+
+  async function hostEndBreakouts() {
+    if (!state.breakoutSession || !state.breakoutSession.session) return;
+    if (!confirm('End breakouts for everyone? Participants will be returned to the main room.')) {
+      return;
+    }
+    try {
+      const res = await rpcEndBreakoutSession(
+        state.breakoutSession.session.id,
+        state.creatorIdentity,
+      );
+      if (res && res.error) throw new Error(res.error);
+      showCallToast('Breakouts ended', '✓');
+      await pollBreakoutSession();
+      renderHostPanel();
+    } catch (e) {
+      console.error('hostEndBreakouts failed:', e);
+      showCallToast('Could not end: ' + e.message, '⚠');
+    }
+  }
+
+  async function hostBroadcast() {
+    if (!state.breakoutSession || !state.breakoutSession.session) return;
+    const input = $('breakout-broadcast-msg');
+    const msg = (input.value || '').trim();
+    if (!msg) return;
+    try {
+      const res = await rpcBroadcastToBreakouts(
+        state.breakoutSession.session.id,
+        msg,
+        state.creatorIdentity,
+      );
+      if (res && res.error) throw new Error(res.error);
+      input.value = '';
+      showCallToast('Broadcast sent', '✓');
+    } catch (e) {
+      console.error('hostBroadcast failed:', e);
+      showCallToast('Broadcast failed: ' + e.message, '⚠');
+    }
+  }
+
+  async function hostVisitRoom(room) {
+    if (!state.breakoutSession || !state.breakoutSession.session) return;
+    try {
+      const res = await rpcJoinBreakoutRoom(
+        state.breakoutSession.session.id,
+        room.id,
+        state.creatorIdentity,
+      );
+      if (res && res.error) throw new Error(res.error);
+      if (!res || !res.token) throw new Error('No token returned');
+
+      // Host uses the same switchRoom flow as participants.
+      hideBreakoutHostPanel();
+      showBreakoutTakeover(room.label, 2);
+      await new Promise((r) => setTimeout(r, 800));
+      const result = await switchRoom(
+        res.server_url || (state.joinData && state.joinData.server_url),
+        res.token,
+        'host_visit',
+      );
+      hideBreakoutTakeover();
+      if (result.ok) {
+        state.currentBreakout = {
+          sessionId: state.breakoutSession.session.id,
+          roomId: room.id,
+          roomName: res.room_name || room.room_name,
+          roomLabel: room.label,
+          closesAt: state.breakoutSession.session.closes_at
+            ? new Date(state.breakoutSession.session.closes_at) : null,
+        };
+        showBreakoutBanner();
+        startBreakoutCountdown();
+      }
+    } catch (e) {
+      console.error('hostVisitRoom failed:', e);
+      showCallToast('Could not visit room: ' + e.message, '⚠');
+    }
+  }
+
+  async function hostResolveHelp(helpId) {
+    try {
+      const res = await rpcResolveHelpRequest(helpId, state.creatorIdentity);
+      if (res && res.error) throw new Error(res.error);
+      await pollBreakoutSession();
+    } catch (e) {
+      console.error('hostResolveHelp failed:', e);
+      showCallToast('Could not dismiss: ' + e.message, '⚠');
+    }
+  }
+
+  async function publishBreakoutAssignPacket(opts) {
+    if (!state.room) return;
+    try {
+      const payload = {
+        type: 'breakout_assign',
+        session_id: opts.sessionId,
+        server_url: opts.serverUrl,
+        token: opts.token,
+        room_name: opts.roomName,
+        room_label: opts.roomLabel,
+      };
+      if (opts.closesAt) payload.closes_at = opts.closesAt;
+      const bytes = new TextEncoder().encode(JSON.stringify(payload));
+      await state.room.localParticipant.publishData(bytes, {
+        reliable: true,
+        destinationIdentities: [opts.targetIdentity],
+      });
+    } catch (e) {
+      console.error('publishBreakoutAssignPacket failed:', e);
+    }
+  }
+
+  function getRemoteParticipantIdentities() {
+    if (!state.room) return [];
+    const out = [];
+    state.room.remoteParticipants.forEach((p) => { out.push(p.identity); });
+    return out;
+  }
+
+  function shortIdentity(id) {
+    if (!id) return 'unknown';
+    if (id.startsWith('guest-')) return 'Guest ' + id.slice(6, 12);
+    if (id.length > 10) return id.slice(0, 8);
+    return id;
+  }
+
+  // ------------------------------------
+  // Toast
+  // ------------------------------------
+  let _toastTimer = null;
+  function showCallToast(text, icon) {
+    const el = $('call-toast');
+    const textEl = $('call-toast-text');
+    const iconEl = $('call-toast-icon');
+    if (!el || !textEl) return;
+    textEl.textContent = text;
+    if (iconEl) iconEl.textContent = icon || 'ℹ';
+    el.classList.remove('hidden');
+    if (_toastTimer) clearTimeout(_toastTimer);
+    _toastTimer = setTimeout(() => {
+      el.classList.add('hidden');
+      _toastTimer = null;
+    }, 4000);
+  }
+
+  // Track last guest name so we can re-mint a main-room token after a
+  // breakout ends. Captured at click time (vs. reading input later, which
+  // may be cleared by the time we need it).
+  document.addEventListener('click', function (e) {
+    if (e.target) {
+      const btn = e.target.closest && e.target.closest('#btn-join');
+      if (btn) {
+        const nameInput = $('guest-name');
+        if (nameInput) state.lastGuestName = (nameInput.value || '').trim();
+      }
+    }
+  }, true);
 
   // Start the app
   if (document.readyState === 'loading') {

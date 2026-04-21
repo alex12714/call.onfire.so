@@ -11,7 +11,7 @@
   <title>OnFire Call</title>
   <meta name="description" content="Join voice and video calls on OnFire. No download required — join from your browser or get the app.">
   <link rel="icon" type="image/png" href="https://onf.to/onfire-logo.png">
-  <link rel="stylesheet" href="/style.css?v=6">
+  <link rel="stylesheet" href="/style.css?v=10">
 </head>
 <body>
 
@@ -348,6 +348,33 @@
     </div>
   </div>
 
+  <!-- Waiting Room Screen -->
+  <div id="screen-waiting" class="screen">
+    <div class="waiting-container">
+      <div class="waiting-header">
+        <div class="logo-small">
+          <img src="https://onf.to/onfire-logo.png" alt="OnFire" width="44" height="44">
+        </div>
+      </div>
+      <div class="waiting-card">
+        <div class="waiting-animation">
+          <div class="waiting-pulse"></div>
+          <div class="waiting-icon">
+            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="10"/>
+              <polyline points="12 6 12 12 16 14"/>
+            </svg>
+          </div>
+        </div>
+        <h2>Waiting to be admitted</h2>
+        <p class="waiting-subtitle">The host will let you in soon...</p>
+        <p class="waiting-name" id="waiting-guest-name"></p>
+        <button id="btn-cancel-wait" class="btn btn-secondary btn-cancel-wait">Cancel</button>
+      </div>
+      <p class="footer-text">Powered by <a href="https://onfire.so" target="_blank">OnFire</a></p>
+    </div>
+  </div>
+
   <!-- Call Screen -->
   <div id="screen-call" class="screen">
     <div class="call-layout">
@@ -377,45 +404,11 @@
               <path d="M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10"/><line x1="1" y1="1" x2="23" y2="23"/>
             </svg>
           </button>
-          <button id="btn-raise-hand" class="control-btn" title="Raise hand">
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M18 11V6a2 2 0 0 0-2-2v0a2 2 0 0 0-2 2v0"/>
-              <path d="M14 10V4a2 2 0 0 0-2-2v0a2 2 0 0 0-2 2v2"/>
-              <path d="M10 10.5V6a2 2 0 0 0-2-2v0a2 2 0 0 0-2 2v8"/>
-              <path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15"/>
-            </svg>
-          </button>
-          <button id="btn-lower-all-hands" class="control-btn hidden" title="Lower all hands">
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M18 11V6a2 2 0 0 0-2-2v0a2 2 0 0 0-2 2v0"/>
-              <path d="M14 10V4a2 2 0 0 0-2-2v0a2 2 0 0 0-2 2v2"/>
-              <path d="M10 10.5V6a2 2 0 0 0-2-2v0a2 2 0 0 0-2 2v8"/>
-              <path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15"/>
-              <line x1="1" y1="1" x2="23" y2="23"/>
-            </svg>
-          </button>
           <button id="btn-chat" class="control-btn" title="Chat">
             <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
             </svg>
             <span id="chat-badge" class="chat-badge hidden">0</span>
-          </button>
-          <button id="btn-polls" class="control-btn" title="Polls">
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <line x1="18" y1="20" x2="18" y2="10"/>
-              <line x1="12" y1="20" x2="12" y2="4"/>
-              <line x1="6" y1="20" x2="6" y2="14"/>
-            </svg>
-            <span id="poll-badge" class="chat-badge hidden">0</span>
-          </button>
-          <button id="btn-breakouts" class="control-btn hidden" title="Breakout rooms">
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <rect x="3" y="3" width="7" height="7" rx="1"/>
-              <rect x="14" y="3" width="7" height="7" rx="1"/>
-              <rect x="3" y="14" width="7" height="7" rx="1"/>
-              <rect x="14" y="14" width="7" height="7" rx="1"/>
-            </svg>
-            <span id="breakout-help-badge" class="chat-badge hidden">0</span>
           </button>
           <button id="btn-screen-share" class="control-btn control-btn-screen-share" title="Share Screen">
             <svg class="icon-screen-share-off" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -425,63 +418,20 @@
               <rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/><line x1="1" y1="1" x2="23" y2="23"/>
             </svg>
           </button>
+          <button id="btn-breakouts" class="control-btn hidden" title="Breakout rooms">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/>
+            </svg>
+            <span id="breakouts-badge" class="chat-badge hidden">0</span>
+          </button>
           <button id="btn-hangup" class="control-btn control-btn-hangup" title="Leave call">
             <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M10.68 13.31a16 16 0 0 0 3.41 2.6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7 2 2 0 0 1 1.72 2v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6"/>
+              <path d="M10.68 13.31a16 16 0 0 0 3.41 2.6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7 2 2 0 0 1 1.72 2v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l"/>
               <line x1="1" y1="1" x2="23" y2="23" stroke-width="2.5"/>
             </svg>
           </button>
         </div>
       </div>
-      <!-- Poll sidebar -->
-      <div id="poll-panel" class="poll-panel hidden">
-        <div class="poll-panel-header">
-          <h3>Polls</h3>
-          <button id="btn-close-polls" class="chat-close-btn" title="Close polls">&times;</button>
-        </div>
-        <div id="poll-list" class="poll-list">
-          <p class="poll-empty">No polls yet. Create the first one!</p>
-        </div>
-        <div class="poll-panel-footer">
-          <button id="btn-open-create-poll" class="btn btn-primary btn-create-poll">+ Create Poll</button>
-        </div>
-      </div>
-
-      <!-- Create Poll Modal -->
-      <div id="poll-create-modal" class="poll-create-modal hidden">
-        <div class="poll-create-backdrop"></div>
-        <div class="poll-create-sheet">
-          <div class="poll-create-header">
-            <h3>Create Poll</h3>
-            <button id="btn-close-create-poll" class="chat-close-btn" title="Cancel">&times;</button>
-          </div>
-          <div class="poll-create-body">
-            <label class="poll-field-label" for="poll-question-input">Question</label>
-            <input type="text" id="poll-question-input" class="poll-input" placeholder="What do you want to ask?" maxlength="500" autocomplete="off">
-
-            <div class="poll-type-group">
-              <label class="poll-type-option">
-                <input type="radio" name="poll-type" value="single" checked>
-                <span>Single choice</span>
-              </label>
-              <label class="poll-type-option">
-                <input type="radio" name="poll-type" value="multiple">
-                <span>Multiple choice</span>
-              </label>
-            </div>
-
-            <label class="poll-field-label">Options</label>
-            <div id="poll-options-list" class="poll-options-list"></div>
-            <button id="btn-add-option" class="btn-add-option" type="button">+ Add option</button>
-            <p id="poll-create-error" class="poll-create-error hidden"></p>
-          </div>
-          <div class="poll-create-footer">
-            <button id="btn-cancel-create-poll" class="btn btn-secondary">Cancel</button>
-            <button id="btn-submit-create-poll" class="btn btn-primary" disabled>Create</button>
-          </div>
-        </div>
-      </div>
-
       <!-- Chat sidebar -->
       <div id="chat-panel" class="chat-panel hidden">
         <div class="chat-panel-header">
@@ -504,111 +454,106 @@
           </button>
         </div>
       </div>
-
-      <!-- Breakouts: in-breakout banner (shown while a participant is inside a breakout room) -->
-      <div id="breakout-banner" class="breakout-banner hidden">
-        <div class="breakout-banner-left">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <rect x="3" y="3" width="7" height="7" rx="1"/>
-            <rect x="14" y="3" width="7" height="7" rx="1"/>
-            <rect x="3" y="14" width="7" height="7" rx="1"/>
-            <rect x="14" y="14" width="7" height="7" rx="1"/>
-          </svg>
-          <span id="breakout-banner-label">Breakout</span>
-          <span class="breakout-banner-sep">•</span>
-          <span id="breakout-banner-timer" class="breakout-timer">--:--</span>
-        </div>
-        <div class="breakout-banner-right">
-          <button id="btn-breakout-help" type="button" class="breakout-banner-btn breakout-help-btn">Request help</button>
-          <button id="btn-breakout-leave" type="button" class="breakout-banner-btn breakout-leave-btn">Leave breakout</button>
-        </div>
-      </div>
-
-      <!-- Breakouts: host "visiting" banner (shown when host visits one of their own breakouts) -->
-      <div id="breakout-host-visit-banner" class="breakout-host-visit-banner hidden">
-        <span>You are visiting as host</span>
-        <button id="btn-breakout-return-main" type="button" class="breakout-banner-btn">Return to main</button>
-      </div>
     </div>
   </div>
 
-  <!-- Breakouts: pre-switch takeover overlay (participant seeing "You're being moved to Room N") -->
-  <div id="breakout-assign-overlay" class="breakout-assign-overlay hidden">
-    <div class="breakout-assign-card">
-      <div class="breakout-assign-icon">
-        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-          <rect x="3" y="3" width="7" height="7" rx="1"/>
-          <rect x="14" y="3" width="7" height="7" rx="1"/>
-          <rect x="3" y="14" width="7" height="7" rx="1"/>
-          <rect x="14" y="14" width="7" height="7" rx="1"/>
+  <!-- Breakout in-call banner (shown while participant is inside a breakout) -->
+  <div id="breakout-banner" class="breakout-banner hidden">
+    <span class="breakout-banner-icon">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/>
+      </svg>
+    </span>
+    <span class="breakout-banner-label">Breakout: <span id="breakout-banner-room">—</span></span>
+    <span class="breakout-banner-sep">·</span>
+    <span class="breakout-banner-countdown">closes in <span id="breakout-banner-time">--:--</span></span>
+    <button id="btn-breakout-help" class="breakout-banner-help" title="Ask host for help">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12" y2="17"/>
+      </svg>
+      <span class="breakout-banner-help-label">Need help</span>
+    </button>
+  </div>
+
+  <!-- Breakout takeover (shown briefly when host assigns a participant to a room) -->
+  <div id="breakout-takeover" class="breakout-takeover hidden" role="dialog" aria-modal="true">
+    <div class="breakout-takeover-sheet">
+      <div class="breakout-takeover-icon">
+        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/>
         </svg>
       </div>
-      <h2>You're being moved</h2>
-      <p id="breakout-assign-room-label">Room</p>
-      <p class="breakout-assign-countdown">Switching in <span id="breakout-assign-seconds">3</span>s...</p>
-      <button id="btn-breakout-assign-cancel" class="btn btn-secondary">Cancel</button>
+      <h3>Moving you to <span id="breakout-takeover-room">a breakout</span></h3>
+      <p>You'll be switched in <span id="breakout-takeover-count">3</span>…</p>
     </div>
   </div>
 
-  <!-- Breakouts: host panel (modal sheet) -->
-  <div id="breakout-panel" class="breakout-panel hidden">
-    <div class="breakout-panel-backdrop"></div>
-    <div class="breakout-panel-sheet">
-      <div class="breakout-panel-header">
-        <h3 id="breakout-panel-title">Breakout rooms</h3>
-        <button id="btn-close-breakout" class="chat-close-btn" title="Close">&times;</button>
+  <!-- Breakout host panel (slide-in, right side, host-only) -->
+  <div id="breakout-host-panel" class="breakout-host-panel hidden">
+    <div class="breakout-host-header">
+      <h3>Breakout rooms</h3>
+      <button id="btn-close-breakout-panel" class="chat-close-btn" title="Close">&times;</button>
+    </div>
+    <div class="breakout-host-body">
+      <!-- Create form -->
+      <div id="breakout-create-form" class="breakout-create-form">
+        <label class="breakout-form-row">
+          <span>Number of rooms</span>
+          <input id="breakout-room-count" type="number" min="2" max="20" value="2">
+        </label>
+        <label class="breakout-form-row">
+          <span>Duration (minutes)</span>
+          <input id="breakout-duration" type="number" min="1" max="120" value="15">
+        </label>
+        <label class="breakout-form-row">
+          <span>Assignment</span>
+          <select id="breakout-assign-mode">
+            <option value="auto">Auto-assign (round-robin)</option>
+            <option value="manual">Manual (assign later)</option>
+          </select>
+        </label>
+        <div id="breakout-manual-list" class="breakout-manual-list hidden"></div>
+        <button id="btn-breakout-create" class="btn btn-primary">Start breakouts</button>
+        <p id="breakout-create-error" class="breakout-error hidden"></p>
       </div>
 
-      <!-- Create view (shown when no active session) -->
-      <div id="breakout-create-view" class="breakout-panel-body">
-        <div class="breakout-field">
-          <label class="breakout-field-label" for="breakout-room-count">Number of rooms</label>
-          <input type="number" id="breakout-room-count" class="breakout-input" min="2" max="20" value="3">
+      <!-- Active session -->
+      <div id="breakout-active" class="breakout-active hidden">
+        <div class="breakout-active-header">
+          <span class="breakout-active-countdown">closes in <span id="breakout-active-time">--:--</span></span>
+          <button id="btn-breakout-end" class="btn btn-danger btn-small">End now</button>
         </div>
-        <div class="breakout-field">
-          <label class="breakout-field-label" for="breakout-duration">Duration (minutes)</label>
-          <input type="number" id="breakout-duration" class="breakout-input" min="1" max="120" value="15">
+        <div id="breakout-help-block" class="breakout-help-block hidden">
+          <div class="breakout-help-title">Help requested</div>
+          <div id="breakout-help-list"></div>
         </div>
-        <div class="breakout-field">
-          <label class="breakout-field-label">Assignment</label>
-          <div class="breakout-mode-group">
-            <label class="breakout-mode-option">
-              <input type="radio" name="breakout-mode" value="auto" checked>
-              <span>Auto (round-robin)</span>
-            </label>
-            <label class="breakout-mode-option">
-              <input type="radio" name="breakout-mode" value="manual">
-              <span>Manual (drag-drop)</span>
-            </label>
-          </div>
-        </div>
-        <div id="breakout-manual-assign" class="breakout-manual-assign hidden">
-          <p class="breakout-help-text">Drag each participant into a room column.</p>
-          <div id="breakout-unassigned-row" class="breakout-unassigned-row" data-room-id="unassigned"></div>
-          <div id="breakout-rooms-grid" class="breakout-rooms-grid"></div>
-        </div>
-        <p id="breakout-create-error" class="breakout-create-error hidden"></p>
-      </div>
-
-      <!-- Active session view -->
-      <div id="breakout-active-view" class="breakout-panel-body hidden">
-        <div id="breakout-timer-banner" class="breakout-timer-banner">
-          <span>Time remaining</span>
-          <strong id="breakout-panel-timer">--:--</strong>
-        </div>
-        <div id="breakout-help-requests" class="breakout-help-requests"></div>
-        <div id="breakout-active-rooms-grid" class="breakout-active-rooms-grid"></div>
-        <div class="breakout-broadcast-area">
-          <label class="breakout-field-label" for="breakout-broadcast-input">Broadcast to all rooms</label>
-          <textarea id="breakout-broadcast-input" class="breakout-input" rows="2" maxlength="500" placeholder="Message to all breakouts..."></textarea>
-          <button id="btn-breakout-broadcast" class="btn btn-secondary breakout-broadcast-btn" disabled>Send to all rooms</button>
+        <div id="breakout-rooms-list" class="breakout-rooms-list"></div>
+        <div class="breakout-broadcast">
+          <textarea id="breakout-broadcast-msg" maxlength="200" placeholder="Broadcast a message to all rooms..."></textarea>
+          <button id="btn-breakout-broadcast" class="btn btn-secondary btn-small">Send to all</button>
         </div>
       </div>
+    </div>
+  </div>
 
-      <div class="breakout-panel-footer">
-        <button id="btn-breakout-cancel" class="btn btn-secondary">Close</button>
-        <button id="btn-breakout-create" class="btn btn-primary">Create Session</button>
-        <button id="btn-breakout-end" class="btn btn-primary hidden">End now</button>
+  <!-- Simple toast (breakout broadcasts, session-end notices) -->
+  <div id="call-toast" class="call-toast hidden">
+    <span id="call-toast-icon" class="call-toast-icon">ℹ</span>
+    <span id="call-toast-text"></span>
+  </div>
+
+  <!-- Host-only hangup choice dialog -->
+  <div id="hangup-dialog" class="hangup-dialog hidden" role="dialog" aria-modal="true" aria-labelledby="hangup-dialog-title">
+    <div id="hangup-backdrop" class="hangup-backdrop"></div>
+    <div class="hangup-sheet">
+      <h3 id="hangup-dialog-title">Leave meeting?</h3>
+      <p class="hangup-dialog-body">
+        You're hosting this meeting. You can leave on your own, or end the meeting for everyone.
+      </p>
+      <div class="hangup-actions">
+        <button id="btn-hangup-end-all" class="btn btn-danger">End meeting for all</button>
+        <button id="btn-hangup-leave" class="btn btn-secondary">Leave meeting</button>
+        <button id="btn-hangup-cancel" class="btn btn-ghost">Cancel</button>
       </div>
     </div>
   </div>
@@ -618,7 +563,7 @@
     <div class="ended-container">
       <div class="ended-icon">
         <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M10.68 13.31a16 16 0 0 0 3.41 2.6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7 2 2 0 0 1 1.72 2v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6"/>
+          <path d="M10.68 13.31a16 16 0 0 0 3.41 2.6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7 2 2 0 0 1 1.72 2v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l"/>
         </svg>
       </div>
       <h2>Call Ended</h2>
@@ -632,11 +577,6 @@
 
   <script src="https://cdn.jsdelivr.net/npm/livekit-client@2.9.1/dist/livekit-client.umd.min.js" integrity="sha384-qHh8MZxg7QXCj+X1yzcbMZRyfCW7GeOH6jq0AIkAxQ5rKDqg7WnoW67wJlzpvybm" crossorigin="anonymous"></script>
   <script src="https://cdn.jsdelivr.net/npm/qrious@4.0.2/dist/qrious.min.js"></script>
-  <!-- Centrifugo client for unified call-chat realtime (onfiremobile-nx2a3).
-       The connect-src CSP enforced by nginx must allow wss://api2.onfire.so for
-       this WebSocket to succeed. If the CSP blocks it, the app gracefully falls
-       back to polling list_call_chat every 3s. -->
-  <script src="https://cdn.jsdelivr.net/npm/centrifuge@5.3.4/dist/centrifuge.js"></script>
-  <script src="/app.js?v=7"></script>
+  <script src="/app.js?v=10"></script>
 </body>
 </html>
