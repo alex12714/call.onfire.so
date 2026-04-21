@@ -34,7 +34,12 @@
     remoteScreenShareParticipant: null,
     pollTimer: null,       // Polling timer for start-meeting flow
     hasSeenInitialRoster: false, // true ~2s after Connected; suppresses join chime for pre-existing participants
+    isHandRaised: false,   // Local raise-hand UI state; mirrors localParticipant.attributes.handRaised
   };
+
+  // Toast queue for "X raised their hand" notifications.
+  const _raiseHandToastQueue = [];
+  let _raiseHandToastActive = false;
 
   // ------------------------------------
   // DOM References
@@ -563,17 +568,39 @@
       $('call-status').classList.add('connected');
     });
 
-    // Data channel messages for chat
+    // Data channel messages for chat + raise-hand signalling
     room.on(LivekitClient.RoomEvent.DataReceived, (payload, participant) => {
       try {
         const text = new TextDecoder().decode(payload);
         const msg = JSON.parse(text);
         if (msg.type === 'chat_message' || msg.type === 'chat_file') {
           chatAddIncoming(msg, participant);
+        } else if (msg.type === 'lower_all_hands') {
+          // A host asked everyone to lower their hand. Best-effort: clear our own
+          // attribute if we have it raised. Other clients enforce the same.
+          if (state.isHandRaised) {
+            lowerLocalHand().catch((e) => console.warn('lowerLocalHand failed:', e));
+          }
         }
       } catch (e) {
         // Ignore non-chat data
       }
+    });
+
+    // Raise-hand attribute changes from any participant (remote or local).
+    // `changed` is a Record<string,string> delta of only the keys that changed.
+    room.on(LivekitClient.RoomEvent.ParticipantAttributesChanged, (changed, participant) => {
+      if (!changed || typeof changed !== 'object') return;
+      if (Object.prototype.hasOwnProperty.call(changed, 'handRaised')) {
+        const newVal = changed.handRaised;
+        const isRemote = participant && participant !== room.localParticipant;
+        // Transition from falsy → timestamp triggers a toast (remote only).
+        if (isRemote && newVal && String(newVal).length > 0) {
+          enqueueRaiseHandToast(participant.name || participant.identity || 'Someone');
+        }
+      }
+      // Re-render so the badge on the tile updates immediately.
+      renderParticipants();
     });
   }
 
@@ -595,6 +622,9 @@
       const tile = createParticipantTile(participant);
       grid.appendChild(tile);
     });
+
+    // Host-only "lower all hands" button visibility depends on whether any hand is up.
+    updateLowerAllHandsButton();
   }
 
   function createParticipantTile(participant) {
@@ -644,6 +674,17 @@
     nameEl.appendChild(micIndicator);
     nameEl.appendChild(nameText);
     tile.appendChild(nameEl);
+
+    // Raised-hand badge — read from LiveKit attributes. Timestamp string (non-empty) = raised.
+    const attrs = (participant && participant.attributes) || {};
+    const handVal = attrs.handRaised;
+    if (handVal && String(handVal).length > 0) {
+      const badge = document.createElement('div');
+      badge.className = 'raised-hand-badge';
+      badge.title = 'Hand raised';
+      badge.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 11V6a2 2 0 0 0-2-2v0a2 2 0 0 0-2 2v0"/><path d="M14 10V4a2 2 0 0 0-2-2v0a2 2 0 0 0-2 2v2"/><path d="M10 10.5V6a2 2 0 0 0-2-2v0a2 2 0 0 0-2 2v8"/><path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15"/></svg>';
+      tile.appendChild(badge);
+    }
 
     return tile;
   }
@@ -767,6 +808,124 @@
     }
   }
 
+  // ------------------------------------
+  // Raise Hand
+  // ------------------------------------
+  async function raiseLocalHand() {
+    if (!state.room || !state.room.localParticipant) return;
+    await state.room.localParticipant.setAttributes({ handRaised: String(Date.now()) });
+    state.isHandRaised = true;
+    updateRaiseHandButton();
+    renderParticipants();
+  }
+
+  async function lowerLocalHand() {
+    if (!state.room || !state.room.localParticipant) return;
+    // Empty string clears the key without colliding with other attributes.
+    await state.room.localParticipant.setAttributes({ handRaised: '' });
+    state.isHandRaised = false;
+    updateRaiseHandButton();
+    renderParticipants();
+  }
+
+  async function toggleRaiseHand() {
+    try {
+      if (state.isHandRaised) await lowerLocalHand();
+      else await raiseLocalHand();
+    } catch (e) {
+      console.error('toggleRaiseHand failed:', e);
+    }
+  }
+
+  function updateRaiseHandButton() {
+    const btn = $('btn-raise-hand');
+    if (btn) btn.classList.toggle('active', state.isHandRaised);
+    updateLowerAllHandsButton();
+  }
+
+  // The web client is currently guest-only, so joinData.is_host is always false.
+  // Kept here so the UI lights up automatically the day hosts can join via web.
+  function updateLowerAllHandsButton() {
+    const btn = $('btn-lower-all-hands');
+    if (!btn) return;
+    const isHost = !!(state.joinData && state.joinData.is_host);
+    const anyHandRaised = hasAnyRaisedHand();
+    const visible = isHost && anyHandRaised;
+    btn.classList.toggle('hidden', !visible);
+  }
+
+  function hasAnyRaisedHand() {
+    if (!state.room) return false;
+    const all = [state.room.localParticipant, ...state.room.remoteParticipants.values()];
+    return all.some((p) => {
+      const v = p && p.attributes && p.attributes.handRaised;
+      return v && String(v).length > 0;
+    });
+  }
+
+  async function lowerAllHands() {
+    if (!state.room) return;
+    // Client-only best-effort: broadcast a DataPacket; every client clears its own
+    // hand when it receives lower_all_hands. There is no server-side API to clear
+    // another participant's attributes on the web SDK, so this is advisory only.
+    try {
+      const data = new TextEncoder().encode(JSON.stringify({ type: 'lower_all_hands' }));
+      await state.room.localParticipant.publishData(data, { reliable: true });
+      // Clear our own hand if raised.
+      if (state.isHandRaised) await lowerLocalHand();
+      showSimpleToast('Asked everyone to lower their hand');
+    } catch (e) {
+      console.error('lowerAllHands failed:', e);
+    }
+  }
+
+  // ------------------------------------
+  // Raise-hand Toast Queue
+  // ------------------------------------
+  function enqueueRaiseHandToast(name) {
+    _raiseHandToastQueue.push(name);
+    _drainRaiseHandToasts();
+  }
+
+  function _drainRaiseHandToasts() {
+    if (_raiseHandToastActive) return;
+    const next = _raiseHandToastQueue.shift();
+    if (!next) return;
+    _raiseHandToastActive = true;
+    _showRaiseHandToast(`${next} raised their hand`, () => {
+      _raiseHandToastActive = false;
+      _drainRaiseHandToasts();
+    });
+  }
+
+  function _showRaiseHandToast(text, onDone) {
+    const toast = document.createElement('div');
+    toast.className = 'raise-hand-toast';
+    toast.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 11V6a2 2 0 0 0-2-2v0a2 2 0 0 0-2 2v0"/><path d="M14 10V4a2 2 0 0 0-2-2v0a2 2 0 0 0-2 2v2"/><path d="M10 10.5V6a2 2 0 0 0-2-2v0a2 2 0 0 0-2 2v8"/><path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15"/></svg><span></span>';
+    toast.querySelector('span').textContent = text;
+    document.body.appendChild(toast);
+    // Auto-dismiss after 3s, then trigger callback so the next queued toast can show.
+    setTimeout(() => {
+      toast.classList.add('dismissing');
+      setTimeout(() => {
+        if (toast.parentNode) toast.parentNode.removeChild(toast);
+        if (onDone) onDone();
+      }, 200);
+    }, 3000);
+  }
+
+  // Generic transient confirmation toast (used for "asked everyone to lower their hand").
+  function showSimpleToast(text) {
+    const toast = document.createElement('div');
+    toast.className = 'raise-hand-toast';
+    toast.textContent = text;
+    document.body.appendChild(toast);
+    setTimeout(() => {
+      toast.classList.add('dismissing');
+      setTimeout(() => { if (toast.parentNode) toast.parentNode.removeChild(toast); }, 200);
+    }, 2500);
+  }
+
   function setupCallControls() {
     $('btn-mic').addEventListener('click', async () => {
       if (!state.room) return;
@@ -785,6 +944,9 @@
     });
 
     $('btn-screen-share').addEventListener('click', () => toggleScreenShare());
+
+    $('btn-raise-hand').addEventListener('click', () => toggleRaiseHand());
+    $('btn-lower-all-hands').addEventListener('click', () => lowerAllHands());
 
     $('btn-chat').addEventListener('click', () => chatTogglePanel());
 
@@ -841,7 +1003,9 @@
     state.remoteScreenShareTrack = null;
     state.remoteScreenShareParticipant = null;
     state.hasSeenInitialRoster = false;
+    state.isHandRaised = false;
     updateScreenShareButton();
+    updateRaiseHandButton();
     hideScreenShareView();
 
     // Clean up audio playback UI and attached remote audio elements

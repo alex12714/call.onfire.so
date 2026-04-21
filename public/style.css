@@ -1794,3 +1794,62 @@ body.landing-active html {
   from { opacity: 0; transform: translate(-50%, -10px); }
   to   { opacity: 1; transform: translate(-50%, 0); }
 }
+
+/* ============================================
+   Raise Hand — badge on participant tile + toast
+   ============================================ */
+.raised-hand-badge {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  background: #FF6B1F;
+  color: #fff;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35);
+  animation: raised-hand-pop 220ms ease-out;
+  z-index: 3;
+}
+.raised-hand-badge svg { display: block; }
+
+@keyframes raised-hand-pop {
+  from { opacity: 0; transform: scale(0.7); }
+  to   { opacity: 1; transform: scale(1); }
+}
+
+.raise-hand-toast {
+  position: fixed;
+  top: 20px;
+  right: 20px;
+  z-index: 9998;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  background: rgba(17, 17, 17, 0.92);
+  color: #fff;
+  font-size: 14px;
+  font-weight: 500;
+  font-family: inherit;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  border: 1px solid rgba(255, 107, 31, 0.35);
+  animation: raise-hand-toast-in 180ms ease-out;
+}
+.raise-hand-toast svg { color: #FF6B1F; flex: 0 0 auto; }
+.raise-hand-toast.dismissing {
+  animation: raise-hand-toast-out 200ms ease-in forwards;
+}
+
+@keyframes raise-hand-toast-in {
+  from { opacity: 0; transform: translateY(-8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes raise-hand-toast-out {
+  from { opacity: 1; transform: translateY(0); }
+  to   { opacity: 0; transform: translateY(-8px); }
+}
