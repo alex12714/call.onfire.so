@@ -17,8 +17,9 @@
   // ------------------------------------
   let state = {
     token: null,           // URL path token
+    hostToken: null,       // ?host=<token> query param — host credentials minted at create_call_link
     callLink: null,        // Data from get_call_link
-    joinData: null,        // Data from join_call_as_guest
+    joinData: null,        // Data from join_call_as_guest / join_call_as_host
     room: null,            // LiveKit Room instance
     localVideoTrack: null,
     localAudioTrack: null,
@@ -153,6 +154,24 @@
     return apiCall('join_call_as_guest', {
       p_link_token: linkToken,
       p_guest_name: guestName || 'Guest',
+    });
+  }
+
+  // ---- Host-scoped join via ?host=<host_token> ------------------------------
+  // When the URL carries ?host=<token>, the caller holds creator credentials
+  // minted by the backend at create_call_link time. joinCallAsHost /
+  // endCallLinkAsHost enforce the host_token server-side (see call_links.host_token).
+  async function joinCallAsHost(linkToken, hostToken) {
+    return apiCall('join_call_as_host', {
+      p_link_token: linkToken,
+      p_host_token: hostToken,
+    });
+  }
+
+  async function endCallLinkAsHost(linkToken, hostToken) {
+    return apiCall('end_call_link_as_host', {
+      p_link_token: linkToken,
+      p_host_token: hostToken,
     });
   }
 
@@ -457,7 +476,20 @@
     btnSpinner.classList.remove('hidden');
 
     try {
-      const data = await joinCallAsGuest(state.token, guestName);
+      // Host path: when ?host=<token> is present, authenticate via the
+      // host_token and inherit creator privileges. Fall back to guest-join on
+      // any error so a stale host link doesn't lock the user out.
+      let data;
+      if (state.hostToken) {
+        data = await joinCallAsHost(state.token, state.hostToken);
+        if (data && data.error) {
+          console.warn('host join failed, falling back to guest:', data.error);
+          state.hostToken = null;
+          data = await joinCallAsGuest(state.token, guestName);
+        }
+      } else {
+        data = await joinCallAsGuest(state.token, guestName);
+      }
 
       if (data.error) {
         showError('Cannot Join', data.error);
@@ -1324,6 +1356,16 @@
   function endCall() {
     if (_endingCall) return;
     _endingCall = true;
+
+    // Host-token holder: tell the backend the meeting is over so the call_link
+    // is marked ended, remaining guests are disconnected by LiveKit, and the
+    // topic gets archived. Fire-and-forget — we still tear down the local UI
+    // on failure. Only runs when joined via ?host=<host_token>.
+    if (state.hostToken && state.token) {
+      endCallLinkAsHost(state.token, state.hostToken).catch((e) => {
+        console.warn('end_call_link_as_host failed:', e && e.message);
+      });
+    }
 
     if (state.timerInterval) {
       clearInterval(state.timerInterval);
@@ -3658,9 +3700,13 @@
     }
 
     // Dev-only: ?forceHost=1 lights up the host-only controls for testing.
+    // Real host flow: ?host=<host_token> grants creator credentials without
+    // authentication. The host_token is minted server-side at
+    // create_call_link time (see call_links.host_token column).
     try {
       const qp = new URLSearchParams(window.location.search);
       if (qp.get('forceHost') === '1') state.isHost = true;
+      state.hostToken = qp.get('host') || null;
     } catch (_) { /* noop */ }
 
     state.token = path;
