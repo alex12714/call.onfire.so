@@ -413,11 +413,12 @@
   async function startCall(joinData) {
     showScreen('call');
 
-    const callContainer = document.querySelector('.call-container');
+    // Prefer the modern .call-layout; fall back to .call-container or the screen-call container.
+    const callContainer = document.querySelector('#screen-call .call-layout') || document.querySelector('.call-container') || document.getElementById('screen-call');
     const overlay = document.createElement('div');
     overlay.className = 'connecting-overlay';
     overlay.innerHTML = '<div class="spinner"></div><p>Connecting to call...</p>';
-    callContainer.appendChild(overlay);
+    if (callContainer) callContainer.appendChild(overlay);
 
     try {
       const LivekitClient = window.LivekitClient;
