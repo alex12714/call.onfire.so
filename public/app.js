@@ -47,6 +47,19 @@
     breakoutTimerTick: null,  // setInterval for UI countdown ticking
     breakoutAssignTimer: null, // setTimeout for the 3-second pre-switch takeover
     breakoutHelpInflight: false,
+
+    // ---- Unified chat (onfiremobile-nx2a3) ----
+    // When state.chatUnifiedEnabled && state.callChat.enabled, chat is routed
+    // through the PostgREST RPCs + Centrifugo (or polling fallback) instead of
+    // LiveKit DataPackets. See handleJoin / initUnifiedChat.
+    chatUnifiedEnabled: false,         // system_config.call_chat_unified value
+    callChat: { conversationId: null, topicId: null, enabled: false },
+    centrifuge: null,                  // Centrifuge client instance
+    centrifugeSubscription: null,      // Subscription for the conversation channel
+    chatPollTimer: null,               // setInterval fallback when Centrifugo is unavailable
+    chatLastSeenTimestamp: null,       // ISO string; cursor for list_call_chat polling
+    chatSeenMessageIds: null,          // Set<string> — dedup Centrifugo echoes vs optimistic renders
+    chatUnifiedActive: false,          // True once initUnifiedChat() has run for this call
   };
 
   // Toast queue for "X raised their hand" notifications.
@@ -141,6 +154,66 @@
       p_link_token: linkToken,
       p_guest_name: guestName || 'Guest',
     });
+  }
+
+  // ---- Unified chat RPCs (onfiremobile-nx2a3) ------------------------------
+  async function sendCallChatMessage(linkToken, guestName, text) {
+    return apiCall('send_call_chat_message', {
+      p_link_token: linkToken,
+      p_guest_name: guestName || 'Guest',
+      p_text: text,
+    });
+  }
+
+  async function sendCallChatFile(linkToken, guestName, fileName, mime, r2Key, sizeBytes) {
+    return apiCall('send_call_chat_file', {
+      p_link_token: linkToken,
+      p_guest_name: guestName || 'Guest',
+      p_file_name: fileName,
+      p_mime: mime,
+      p_r2_key: r2Key,
+      p_size_bytes: sizeBytes,
+    });
+  }
+
+  async function listCallChat(linkToken, sinceIso) {
+    return apiCall('list_call_chat', {
+      p_link_token: linkToken,
+      p_since: sinceIso || null,
+    });
+  }
+
+  async function generateGuestChatUploadUrl(linkToken, fileName, mime, sizeBytes) {
+    return apiCall('generate_guest_chat_upload_url', {
+      p_link_token: linkToken,
+      p_file_name: fileName,
+      p_mime: mime,
+      p_size_bytes: sizeBytes,
+    });
+  }
+
+  async function generateGuestCentrifugoToken(linkToken) {
+    return apiCall('generate_guest_centrifugo_token', {
+      p_link_token: linkToken,
+    });
+  }
+
+  // Read the call_chat_unified feature flag from system_config. web_anon is
+  // permitted to read this key via the anon_read_public_config RLS policy.
+  // Returns true iff the value is exactly 'true' (string). Any error → false.
+  async function fetchCallChatUnifiedFlag() {
+    try {
+      const resp = await fetch(`${API_BASE}/system_config?key=eq.call_chat_unified&select=value`, {
+        headers: { 'Accept': 'application/json' },
+      });
+      if (!resp.ok) return false;
+      const rows = await resp.json();
+      if (!Array.isArray(rows) || rows.length === 0) return false;
+      return String(rows[0].value).toLowerCase() === 'true';
+    } catch (e) {
+      console.debug('fetchCallChatUnifiedFlag failed:', e && e.message);
+      return false;
+    }
   }
 
   // ------------------------------------
@@ -396,6 +469,23 @@
       // Honor server-side is_host; fall back to forceHost dev shortcut (read in init()).
       if (data && data.is_host) state.isHost = true;
 
+      // Capture the unified-chat context (conversation + topic). Both must be
+      // non-null for the new chat path; older link rows may not have them.
+      const convId  = data && (data.conversation_id || data.conversationId);
+      const topicId = data && (data.topic_id || data.topicId);
+      state.callChat = {
+        conversationId: convId || null,
+        topicId: topicId || null,
+        enabled: !!(convId && topicId),
+      };
+
+      // Read the server-side feature flag. Don't block join on failure — default off.
+      try {
+        state.chatUnifiedEnabled = await fetchCallChatUnifiedFlag();
+      } catch (_) {
+        state.chatUnifiedEnabled = false;
+      }
+
       stopVideoPreview();
       await startCall(data);
     } catch (err) {
@@ -483,6 +573,11 @@
       // Breakouts: reveal the host-only button (if this is a host) and pull any
       // active breakout session so a host that rejoins sees existing state.
       breakoutsOnCallJoined();
+
+      // Unified chat (onfiremobile-nx2a3): if enabled + link is topic-backed,
+      // backfill history and attach to Centrifugo (or polling fallback). Chat
+      // sends now route through the PostgREST RPCs instead of DataPackets.
+      initUnifiedChat().catch((e) => console.warn('initUnifiedChat failed:', e && e.message));
 
     } catch (err) {
       console.error('Call start error:', err);
@@ -597,6 +692,10 @@
         const text = new TextDecoder().decode(payload);
         const msg = JSON.parse(text);
         if (msg.type === 'chat_message' || msg.type === 'chat_file') {
+          // When the unified chat path is active, drop any legacy DataPacket
+          // chat traffic so authed + guest messages don't double-render
+          // (the unified path already carries them via Centrifugo/poll).
+          if (state.chatUnifiedActive) return;
           chatAddIncoming(msg, participant);
         } else if (msg.type === 'lower_all_hands') {
           // A host asked everyone to lower their hand. Best-effort: clear our own
@@ -1253,6 +1352,17 @@
     // Clear breakout state and UI
     breakoutsTearDown();
 
+    // Tear down the unified chat realtime + polling so no requests fire after hangup.
+    teardownUnifiedChat();
+    // Reset chat UI state so a rejoin starts with an empty panel.
+    chatMessages.length = 0;
+    chatUnreadCount = 0;
+    chatPanelOpen = false;
+    const chatPanelEl = document.getElementById('chat-panel');
+    if (chatPanelEl) chatPanelEl.classList.add('hidden');
+    const chatBadgeEl = document.getElementById('chat-badge');
+    if (chatBadgeEl) { chatBadgeEl.textContent = '0'; chatBadgeEl.classList.add('hidden'); }
+
     // Clear poll state and close poll UI
     pollState.polls.clear();
     pollState.inflight.clear();
@@ -1364,6 +1474,17 @@
     const text = input.value.trim();
     if (!text || !state.room) return;
 
+    // Unified chat path — route through send_call_chat_message RPC. The
+    // Centrifugo/polling layer echoes our own message back; we dedup in
+    // chatAddMessage by id. Render optimistically with a local UUID; when the
+    // echo arrives, the dedup key flips to the server message_id.
+    if (state.chatUnifiedActive) {
+      chatSendMessageUnified(text);
+      input.value = '';
+      $('btn-send-chat').disabled = true;
+      return;
+    }
+
     const msg = {
       type: 'chat_message',
       id: crypto.randomUUID(),
@@ -1388,6 +1509,14 @@
 
   function chatSendFile(file) {
     if (!state.room || !file) return;
+
+    // Unified chat path — upload to R2 directly via presigned PUT, then
+    // register the attachment via send_call_chat_file. 25 MB cap matches the
+    // server-side bound from generate_guest_chat_upload_url.
+    if (state.chatUnifiedActive) {
+      chatSendFileUnified(file);
+      return;
+    }
 
     // Limit file size to 2MB for data channel
     if (file.size > 2 * 1024 * 1024) {
@@ -1437,6 +1566,105 @@
     }
   }
 
+  // ---- Unified chat rendering helper (onfiremobile-nx2a3) ------------------
+  //
+  // Adds a message that originated from the unified path (list_call_chat,
+  // Centrifugo publication, or our own send). Messages carry their server
+  // message_id as .id; dedup uses state.chatSeenMessageIds. Optimistically
+  // rendered outgoing messages use a client-generated UUID as the initial id
+  // and carry .optimisticKey — when the server echo arrives we splice out the
+  // optimistic entry and insert the authoritative one.
+  function chatAddMessage(normalized) {
+    if (!normalized || !normalized.id) return;
+    if (!state.chatSeenMessageIds) state.chatSeenMessageIds = new Set();
+
+    // If the server echo arrives for a message we already rendered
+    // optimistically, replace the optimistic row in place so the id/timestamp
+    // reflect the authoritative server values.
+    if (normalized.isSelf && normalized.optimisticReplaces) {
+      const key = normalized.optimisticReplaces;
+      for (let i = 0; i < chatMessages.length; i++) {
+        if (chatMessages[i].optimisticKey === key) {
+          chatMessages[i] = { ...normalized };
+          state.chatSeenMessageIds.add(normalized.id);
+          chatRenderMessages();
+          if (chatPanelOpen) chatScrollToBottom();
+          return;
+        }
+      }
+    }
+
+    if (state.chatSeenMessageIds.has(normalized.id)) return;
+    state.chatSeenMessageIds.add(normalized.id);
+
+    chatMessages.push(normalized);
+
+    // Advance the polling cursor so the fallback doesn't re-fetch us later.
+    if (normalized.timestamp) {
+      const iso = new Date(normalized.timestamp).toISOString();
+      if (!state.chatLastSeenTimestamp || iso > state.chatLastSeenTimestamp) {
+        state.chatLastSeenTimestamp = iso;
+      }
+    }
+
+    chatRenderMessages();
+
+    if (normalized.isSelf) {
+      if (chatPanelOpen) chatScrollToBottom();
+    } else {
+      if (chatPanelOpen) {
+        chatScrollToBottom();
+      } else {
+        chatUnreadCount++;
+        const badge = $('chat-badge');
+        badge.textContent = String(chatUnreadCount);
+        badge.classList.remove('hidden');
+      }
+    }
+  }
+
+  // Normalize a list_call_chat row / Centrifugo publication into the shape the
+  // chat renderer expects. Server shape:
+  //   { id, sender_id, sender_display_name, is_guest_message, content,
+  //     attachments: [...], message_type, created_at }
+  // For attachments: first entry wins (one-attachment-per-message in this path).
+  function normalizeUnifiedMessage(row) {
+    if (!row || !row.id) return null;
+    const createdMs = row.created_at ? Date.parse(row.created_at) : Date.now();
+    const senderName = row.sender_display_name || row.sender_name || 'Guest';
+    const isSelf = !!(row.is_guest_message
+      && state.guestName
+      && row.sender_display_name
+      && row.sender_display_name === state.guestName);
+    const attachments = Array.isArray(row.attachments) ? row.attachments : [];
+    const firstAttachment = attachments.length > 0 ? attachments[0] : null;
+
+    if (firstAttachment || row.message_type === 'file' || row.message_type === 'image') {
+      return {
+        id: row.id,
+        type: 'chat_file',
+        sender: row.sender_id || senderName,
+        senderName: senderName,
+        fileName: (firstAttachment && (firstAttachment.file_name || firstAttachment.name)) || 'file',
+        fileSize: (firstAttachment && (firstAttachment.size_bytes || firstAttachment.size)) || 0,
+        mimeType: (firstAttachment && (firstAttachment.mime || firstAttachment.mime_type)) || 'application/octet-stream',
+        publicUrl: (firstAttachment && (firstAttachment.public_url || firstAttachment.url)) || null,
+        timestamp: createdMs,
+        isSelf,
+      };
+    }
+
+    return {
+      id: row.id,
+      type: 'chat_message',
+      sender: row.sender_id || senderName,
+      senderName: senderName,
+      text: row.content || '',
+      timestamp: createdMs,
+      isSelf,
+    };
+  }
+
   function chatRenderMessages() {
     const container = $('chat-messages');
     container.innerHTML = '';
@@ -1453,26 +1681,63 @@
       }
 
       if (msg.type === 'chat_file') {
-        const fileEl = document.createElement('a');
-        fileEl.className = 'chat-msg-file';
+        // Unified path: we have a publicUrl (R2 CDN link). Legacy path: base64
+        // fileData. Also: image MIMEs render an inline thumbnail above the
+        // download card.
+        const mime = msg.mimeType || 'application/octet-stream';
+        const isImage = /^image\//i.test(mime);
+        let hrefUrl = null;
 
-        // Create download blob from base64
-        if (msg.fileData) {
+        if (msg.publicUrl) {
+          hrefUrl = msg.publicUrl;
+        } else if (msg.fileData) {
           try {
             const byteChars = atob(msg.fileData);
             const byteNums = new Array(byteChars.length);
             for (let i = 0; i < byteChars.length; i++) byteNums[i] = byteChars.charCodeAt(i);
-            const blob = new Blob([new Uint8Array(byteNums)], { type: msg.mimeType || 'application/octet-stream' });
-            fileEl.href = URL.createObjectURL(blob);
-            fileEl.download = msg.fileName;
+            const blob = new Blob([new Uint8Array(byteNums)], { type: mime });
+            hrefUrl = URL.createObjectURL(blob);
           } catch (e) {
-            fileEl.href = '#';
+            hrefUrl = null;
           }
+        }
+
+        if (isImage && hrefUrl) {
+          const thumb = document.createElement('a');
+          thumb.className = 'chat-msg-image';
+          thumb.href = hrefUrl;
+          thumb.target = '_blank';
+          thumb.rel = 'noopener noreferrer';
+          const img = document.createElement('img');
+          img.src = hrefUrl;
+          img.alt = msg.fileName || 'image';
+          img.loading = 'lazy';
+          img.style.maxWidth = '220px';
+          img.style.maxHeight = '220px';
+          img.style.borderRadius = '8px';
+          img.style.display = 'block';
+          thumb.appendChild(img);
+          wrapper.appendChild(thumb);
+        }
+
+        const fileEl = document.createElement('a');
+        fileEl.className = 'chat-msg-file';
+        if (hrefUrl) {
+          fileEl.href = hrefUrl;
+          // Unified-path URLs open in a new tab; legacy blob URLs still download.
+          if (msg.publicUrl) {
+            fileEl.target = '_blank';
+            fileEl.rel = 'noopener noreferrer';
+          } else {
+            fileEl.download = msg.fileName;
+          }
+        } else {
+          fileEl.href = '#';
         }
 
         fileEl.innerHTML = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>'
           + '<div class="chat-msg-file-info">'
-          + '<div class="chat-msg-file-name">' + escapeHtml(msg.fileName) + '</div>'
+          + '<div class="chat-msg-file-name">' + escapeHtml(msg.fileName || 'file') + '</div>'
           + '<div class="chat-msg-file-size">' + formatFileSize(msg.fileSize) + '</div>'
           + '</div>';
 
@@ -1511,6 +1776,329 @@
     if (bytes < 1024) return bytes + ' B';
     if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
     return (bytes / 1048576).toFixed(1) + ' MB';
+  }
+
+  // ------------------------------------
+  // Unified Chat Module (onfiremobile-nx2a3)
+  // ------------------------------------
+  // Flow when state.chatUnifiedEnabled && state.callChat.enabled:
+  //   1. Backfill history via list_call_chat(token, null) — late joiners see
+  //      prior messages for this topic.
+  //   2. Mint a guest Centrifugo sub-token via generate_guest_centrifugo_token
+  //      and open a WebSocket to wss://api2.onfire.so/connection/websocket.
+  //   3. Subscribe to the channel "conversation:<uuid>" — the Postgres trigger
+  //      in mesh_sync_schema.sql emits every new message to that channel.
+  //   4. On WS failure (CSP blocks wss, token mint fails, connection drops and
+  //      can't reconnect) fall back to 3-second polling of list_call_chat with
+  //      the timestamp cursor.
+  //
+  // Sending:
+  //   - Optimistic render with a client-side key so the UI is snappy.
+  //   - POST to send_call_chat_message / send_call_chat_file.
+  //   - The Centrifugo echo (or next poll) carries the server message_id —
+  //     chatAddMessage splices the optimistic row out and inserts the
+  //     authoritative one (see `optimisticReplaces`).
+
+  const CHAT_POLL_INTERVAL_MS = 3000;
+  const CHAT_MAX_FILE_BYTES = 25 * 1024 * 1024; // matches server cap in generate_guest_chat_upload_url
+
+  async function initUnifiedChat() {
+    if (!state.chatUnifiedEnabled || !state.callChat || !state.callChat.enabled) return;
+    if (state.chatUnifiedActive) return;
+
+    state.chatUnifiedActive = true;
+    state.chatSeenMessageIds = new Set();
+    state.chatLastSeenTimestamp = null;
+
+    // 1. Backfill.
+    try {
+      const history = await listCallChat(state.token, null);
+      if (Array.isArray(history)) {
+        for (const row of history) {
+          const norm = normalizeUnifiedMessage(row);
+          if (norm) chatAddMessage(norm);
+        }
+      }
+    } catch (err) {
+      console.warn('Unified chat backfill failed:', err && err.message);
+    }
+
+    // 2. Subscribe (Centrifugo) — polling fallback if that fails.
+    await startChatRealtime();
+  }
+
+  async function startChatRealtime() {
+    // Polling-only fallback is safe if the global Centrifuge class isn't
+    // available (CDN load failure) or the CSP blocks the WS connection.
+    if (typeof window.Centrifuge !== 'function') {
+      console.warn('Centrifuge SDK not loaded — falling back to polling.');
+      startChatPolling();
+      return;
+    }
+
+    let tokenData;
+    try {
+      tokenData = await generateGuestCentrifugoToken(state.token);
+    } catch (err) {
+      console.warn('generate_guest_centrifugo_token failed:', err && err.message);
+      startChatPolling();
+      return;
+    }
+    if (!tokenData || tokenData.error || !tokenData.sub_token || !tokenData.channel) {
+      console.warn('generate_guest_centrifugo_token returned error:', tokenData && tokenData.error);
+      startChatPolling();
+      return;
+    }
+
+    try {
+      // Centrifugo is reachable on the main API host. If the CSP
+      // connect-src does not include wss://api2.onfire.so, the browser will
+      // block this and fire a `disconnected` event — we catch it and poll.
+      const wsUrl = API_BASE.replace(/^https:/i, 'wss:').replace(/^http:/i, 'ws:') + '/connection/websocket';
+      const cf = new window.Centrifuge(wsUrl, {
+        token: tokenData.sub_token,
+        // Keep reconnect tries modest — if the CSP is blocking we want to
+        // fall back to polling quickly rather than spam retries.
+        minReconnectDelay: 1000,
+        maxReconnectDelay: 10000,
+      });
+
+      state.centrifuge = cf;
+
+      let connected = false;
+      let fellBack = false;
+      const fallback = (reason) => {
+        if (fellBack) return;
+        fellBack = true;
+        console.warn('Centrifugo unavailable, falling back to polling:', reason);
+        try { cf.disconnect(); } catch (_) {}
+        state.centrifuge = null;
+        state.centrifugeSubscription = null;
+        startChatPolling();
+      };
+
+      cf.on('connected', () => {
+        connected = true;
+      });
+
+      cf.on('error', (ctx) => {
+        console.debug('Centrifugo error:', ctx && ctx.error);
+      });
+
+      cf.on('disconnected', (ctx) => {
+        // Terminal disconnect (auth failure, CSP block, explicit
+        // unrecoverable). Code 3xxx/4xxx with no reconnect schedule → fall
+        // back. Transient disconnects keep reconnecting.
+        if (!connected) {
+          fallback(ctx && ctx.reason);
+        }
+      });
+
+      const sub = cf.newSubscription(tokenData.channel);
+      state.centrifugeSubscription = sub;
+
+      sub.on('publication', (ctx) => {
+        try {
+          const data = ctx && ctx.data;
+          if (!data) return;
+          // The trigger publishes the chat_messages row directly. Normalize it
+          // into the shared renderer shape.
+          const norm = normalizeUnifiedMessage(data);
+          if (norm) chatAddMessage(norm);
+        } catch (e) {
+          console.warn('Centrifugo publication handler failed:', e && e.message);
+        }
+      });
+
+      sub.on('error', (ctx) => {
+        console.debug('Subscription error:', ctx && ctx.error);
+      });
+
+      sub.subscribe();
+      cf.connect();
+
+      // If we haven't reached `connected` within 5s, the browser likely
+      // blocked the WS (CSP) or the server is unreachable — fall back.
+      setTimeout(() => {
+        if (!connected && !fellBack) fallback('connect-timeout');
+      }, 5000);
+    } catch (err) {
+      console.warn('Centrifugo init threw, falling back to polling:', err && err.message);
+      startChatPolling();
+    }
+  }
+
+  function startChatPolling() {
+    if (state.chatPollTimer) return;
+    const tick = async () => {
+      if (!state.chatUnifiedActive) return;
+      try {
+        const since = state.chatLastSeenTimestamp; // null → full backfill; we already did that, so fine
+        const rows = await listCallChat(state.token, since);
+        if (Array.isArray(rows)) {
+          for (const row of rows) {
+            const norm = normalizeUnifiedMessage(row);
+            if (norm) chatAddMessage(norm);
+          }
+        }
+      } catch (err) {
+        console.debug('list_call_chat poll failed:', err && err.message);
+      }
+    };
+    state.chatPollTimer = setInterval(tick, CHAT_POLL_INTERVAL_MS);
+    // Nudge once immediately so the cursor is fresh, then rely on the interval.
+    tick();
+  }
+
+  function chatSendMessageUnified(text) {
+    const optimisticKey = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : ('opt-' + Date.now() + '-' + Math.random());
+    const optimisticTs = Date.now();
+    chatAddMessage({
+      id: optimisticKey,
+      type: 'chat_message',
+      sender: 'self',
+      senderName: state.guestName || 'You',
+      text,
+      timestamp: optimisticTs,
+      isSelf: true,
+      optimisticKey,
+    });
+
+    sendCallChatMessage(state.token, state.guestName, text)
+      .then((resp) => {
+        if (resp && resp.error) {
+          console.warn('send_call_chat_message error:', resp.error);
+          chatMarkOptimisticFailed(optimisticKey, resp.error);
+          return;
+        }
+        if (resp && resp.message_id) {
+          // Splice the optimistic row with the authoritative server copy.
+          const createdMs = resp.created_at ? Date.parse(resp.created_at) : optimisticTs;
+          chatAddMessage({
+            id: resp.message_id,
+            type: 'chat_message',
+            sender: 'self',
+            senderName: state.guestName || 'You',
+            text,
+            timestamp: createdMs,
+            isSelf: true,
+            optimisticReplaces: optimisticKey,
+          });
+        }
+      })
+      .catch((err) => {
+        console.warn('send_call_chat_message threw:', err && err.message);
+        chatMarkOptimisticFailed(optimisticKey, 'Send failed');
+      });
+  }
+
+  async function chatSendFileUnified(file) {
+    if (!file) return;
+    if (file.size > CHAT_MAX_FILE_BYTES) {
+      alert('File must be under 25 MB');
+      return;
+    }
+
+    const optimisticKey = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : ('opt-' + Date.now() + '-' + Math.random());
+    chatAddMessage({
+      id: optimisticKey,
+      type: 'chat_file',
+      sender: 'self',
+      senderName: state.guestName || 'You',
+      fileName: file.name,
+      fileSize: file.size,
+      mimeType: file.type || 'application/octet-stream',
+      publicUrl: null, // will arrive via server echo
+      timestamp: Date.now(),
+      isSelf: true,
+      optimisticKey,
+      uploading: true,
+    });
+
+    try {
+      const presign = await generateGuestChatUploadUrl(
+        state.token,
+        file.name,
+        file.type || 'application/octet-stream',
+        file.size,
+      );
+      if (!presign || presign.error || !presign.put_url || !presign.r2_key) {
+        throw new Error(presign && presign.error ? presign.error : 'No presign URL');
+      }
+
+      // Respect the server's reported cap if it's stricter than our local one.
+      if (presign.max_size_bytes && file.size > presign.max_size_bytes) {
+        throw new Error('File exceeds server size limit');
+      }
+
+      const putResp = await fetch(presign.put_url, {
+        method: 'PUT',
+        headers: { 'Content-Type': file.type || 'application/octet-stream' },
+        body: file,
+      });
+      if (!putResp.ok) {
+        throw new Error('R2 upload failed: ' + putResp.status);
+      }
+
+      const sendResp = await sendCallChatFile(
+        state.token,
+        state.guestName,
+        file.name,
+        file.type || 'application/octet-stream',
+        presign.r2_key,
+        file.size,
+      );
+      if (!sendResp || sendResp.error) {
+        throw new Error(sendResp && sendResp.error ? sendResp.error : 'send_call_chat_file failed');
+      }
+      // Splice with authoritative row.
+      const createdMs = sendResp.created_at ? Date.parse(sendResp.created_at) : Date.now();
+      chatAddMessage({
+        id: sendResp.message_id,
+        type: 'chat_file',
+        sender: 'self',
+        senderName: state.guestName || 'You',
+        fileName: file.name,
+        fileSize: file.size,
+        mimeType: file.type || 'application/octet-stream',
+        publicUrl: presign.public_url,
+        timestamp: createdMs,
+        isSelf: true,
+        optimisticReplaces: optimisticKey,
+      });
+    } catch (err) {
+      console.warn('chatSendFileUnified failed:', err && err.message);
+      chatMarkOptimisticFailed(optimisticKey, err && err.message ? err.message : 'Upload failed');
+    }
+  }
+
+  function chatMarkOptimisticFailed(optimisticKey, reason) {
+    for (let i = 0; i < chatMessages.length; i++) {
+      if (chatMessages[i].optimisticKey === optimisticKey) {
+        chatMessages[i].failed = true;
+        chatMessages[i].failedReason = reason;
+        break;
+      }
+    }
+    chatRenderMessages();
+  }
+
+  function teardownUnifiedChat() {
+    state.chatUnifiedActive = false;
+    if (state.chatPollTimer) {
+      clearInterval(state.chatPollTimer);
+      state.chatPollTimer = null;
+    }
+    if (state.centrifugeSubscription) {
+      try { state.centrifugeSubscription.unsubscribe(); } catch (_) {}
+      state.centrifugeSubscription = null;
+    }
+    if (state.centrifuge) {
+      try { state.centrifuge.disconnect(); } catch (_) {}
+      state.centrifuge = null;
+    }
+    state.chatSeenMessageIds = null;
+    state.chatLastSeenTimestamp = null;
   }
 
   // ------------------------------------

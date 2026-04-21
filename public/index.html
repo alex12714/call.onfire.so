@@ -632,6 +632,11 @@
 
   <script src="https://cdn.jsdelivr.net/npm/livekit-client@2.9.1/dist/livekit-client.umd.min.js" integrity="sha384-qHh8MZxg7QXCj+X1yzcbMZRyfCW7GeOH6jq0AIkAxQ5rKDqg7WnoW67wJlzpvybm" crossorigin="anonymous"></script>
   <script src="https://cdn.jsdelivr.net/npm/qrious@4.0.2/dist/qrious.min.js"></script>
-  <script src="/app.js?v=6"></script>
+  <!-- Centrifugo client for unified call-chat realtime (onfiremobile-nx2a3).
+       The connect-src CSP enforced by nginx must allow wss://api2.onfire.so for
+       this WebSocket to succeed. If the CSP blocks it, the app gracefully falls
+       back to polling list_call_chat every 3s. -->
+  <script src="https://cdn.jsdelivr.net/npm/centrifuge@5.3.4/dist/centrifuge.js"></script>
+  <script src="/app.js?v=7"></script>
 </body>
 </html>
