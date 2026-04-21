@@ -37,6 +37,15 @@
     pollTimer: null,       // Polling timer for start-meeting flow
     waitingPollTimer: null,
 
+    // -- Raise-hand ---------------------------------------------------------
+    isHandRaised: false,    // Local raise-hand UI state; mirrors attribute
+
+    // -- Join/leave chime (suppresses spurious chimes for initial roster) ---
+    hasSeenInitialRoster: false,  // true ~2s after room connect
+    rosterGateTimer: null,
+    joinChimeEl: null,
+    leaveChimeEl: null,
+
     // -- Breakouts -----------------------------------------------------------
     // Identity used when calling breakout RPCs. For guests, populated from
     // room.localParticipant.identity after connect (`guest-<hex>`). For hosts
@@ -467,6 +476,18 @@
 
       await room.connect(joinData.server_url, joinData.token);
 
+      // Unblock remote audio playback while the join-click user-gesture chain is
+      // still fresh. Browsers otherwise suppress the hidden <audio> elements the
+      // LiveKit SDK auto-attaches. The AudioPlaybackStatusChanged handler below
+      // surfaces a tap-to-enable overlay if the browser still blocks it.
+      try { await room.startAudio(); } catch (_) { /* handled by event */ }
+      if (!room.canPlaybackAudio) showEnableAudioPrompt(room);
+
+      // Arm chime suppression for the initial roster re-advertisement.
+      state.hasSeenInitialRoster = false;
+      if (state.rosterGateTimer) clearTimeout(state.rosterGateTimer);
+      state.rosterGateTimer = setTimeout(() => { state.hasSeenInitialRoster = true; }, 2000);
+
       const isVideo = joinData.call_type === 'video';
 
       await room.localParticipant.setMicrophoneEnabled(!state.isPreviewMicOff);
@@ -525,10 +546,25 @@
   function setupRoomEvents(room) {
     const LivekitClient = window.LivekitClient;
 
-    room.on(LivekitClient.RoomEvent.ParticipantConnected, () => renderParticipants());
-    room.on(LivekitClient.RoomEvent.ParticipantDisconnected, () => renderParticipants());
+    room.on(LivekitClient.RoomEvent.ParticipantConnected, (participant) => {
+      playChimeForParticipant(participant, 'join');
+      renderParticipants();
+    });
+    room.on(LivekitClient.RoomEvent.ParticipantDisconnected, (participant) => {
+      playChimeForParticipant(participant, 'leave');
+      renderParticipants();
+    });
 
     room.on(LivekitClient.RoomEvent.TrackSubscribed, (track, publication, participant) => {
+      // Explicitly attach remote audio tracks to a hidden <audio> element.
+      // LiveKit auto-attaches by default, but keeping an explicit reference
+      // guarantees playback survives DOM re-renders from renderParticipants().
+      if (track.kind === LivekitClient.Track.Kind.Audio) {
+        const el = track.attach();
+        el.setAttribute('data-onfire-remote-audio', participant.identity || '');
+        el.style.display = 'none';
+        document.body.appendChild(el);
+      }
       if (track.source === LivekitClient.Track.Source.ScreenShare) {
         showScreenShareView(track, participant);
       }
@@ -536,8 +572,29 @@
     });
 
     room.on(LivekitClient.RoomEvent.TrackUnsubscribed, (track) => {
+      if (track && track.kind === LivekitClient.Track.Kind.Audio) {
+        track.detach().forEach((el) => el.remove());
+      }
       if (track.source === LivekitClient.Track.Source.ScreenShare) {
         hideScreenShareView();
+      }
+      renderParticipants();
+    });
+
+    room.on(LivekitClient.RoomEvent.AudioPlaybackStatusChanged, () => {
+      if (room.canPlaybackAudio) hideEnableAudioPrompt();
+      else showEnableAudioPrompt(room);
+    });
+
+    // Raise-hand: per-participant attributes key `handRaised` flips to a
+    // timestamp string when raised, empty when lowered. Any change emits
+    // ParticipantAttributesChanged with the delta in `changed`.
+    room.on(LivekitClient.RoomEvent.ParticipantAttributesChanged, (changed, participant) => {
+      if (!changed || !('handRaised' in changed)) return;
+      const raised = !!changed.handRaised;
+      if (raised && participant && participant.identity !== (state.myIdentity || null)) {
+        const name = participant.name || participant.identity || 'Someone';
+        enqueueRaiseHandToast(name + ' raised their hand');
       }
       renderParticipants();
     });
@@ -777,6 +834,9 @@
     $('btn-screen-share').addEventListener('click', () => toggleScreenShare());
 
     $('btn-chat').addEventListener('click', () => chatTogglePanel());
+
+    const raiseBtn = document.getElementById('btn-raise-hand');
+    if (raiseBtn) raiseBtn.addEventListener('click', () => toggleRaiseHand());
 
     $('btn-hangup').addEventListener('click', () => {
       if (state.isHost) {
@@ -1239,6 +1299,83 @@
       clearInterval(state.waitingPollTimer);
       state.waitingPollTimer = null;
     }
+  }
+
+  // ------------------------------------
+  // Audio Playback Unblock Prompt
+  // ------------------------------------
+  function showEnableAudioPrompt(room) {
+    if (document.getElementById('enable-audio-prompt')) return;
+    const prompt = document.createElement('button');
+    prompt.id = 'enable-audio-prompt';
+    prompt.className = 'enable-audio-prompt';
+    prompt.type = 'button';
+    prompt.innerHTML = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg><span>Tap to enable audio</span>';
+    prompt.addEventListener('click', async () => {
+      try { await room.startAudio(); } catch (e) { console.warn('startAudio failed:', e); }
+      if (room.canPlaybackAudio) hideEnableAudioPrompt();
+    });
+    document.body.appendChild(prompt);
+  }
+  function hideEnableAudioPrompt() {
+    const p = document.getElementById('enable-audio-prompt');
+    if (p) p.remove();
+  }
+
+  // ------------------------------------
+  // Join/leave chime
+  // ------------------------------------
+  function ensureChimePlayers() {
+    if (!state.joinChimeEl) {
+      try {
+        state.joinChimeEl = new Audio('/sounds/join.ogg');
+        state.joinChimeEl.volume = 0.4;
+        state.leaveChimeEl = new Audio('/sounds/leave.ogg');
+        state.leaveChimeEl.volume = 0.4;
+      } catch (_) { /* leave null */ }
+    }
+  }
+  function playChimeForParticipant(participant, kind) {
+    if (!state.hasSeenInitialRoster) return;
+    if (!participant || !state.room) return;
+    if (participant.identity === (state.room.localParticipant && state.room.localParticipant.identity)) return;
+    ensureChimePlayers();
+    const el = kind === 'join' ? state.joinChimeEl : state.leaveChimeEl;
+    if (!el) return;
+    try { el.currentTime = 0; el.play().catch(() => {}); } catch (_) {}
+  }
+
+  // ------------------------------------
+  // Raise-hand toast queue
+  // ------------------------------------
+  const _raiseHandToastQueue = [];
+  let _raiseHandToastActive = false;
+  function enqueueRaiseHandToast(text) {
+    _raiseHandToastQueue.push(text);
+    if (!_raiseHandToastActive) _drainRaiseHandToast();
+  }
+  function _drainRaiseHandToast() {
+    const text = _raiseHandToastQueue.shift();
+    if (!text) { _raiseHandToastActive = false; return; }
+    _raiseHandToastActive = true;
+    const el = document.createElement('div');
+    el.className = 'raise-hand-toast';
+    el.textContent = text;
+    document.body.appendChild(el);
+    setTimeout(() => { el.remove(); _drainRaiseHandToast(); }, 3000);
+  }
+  async function toggleRaiseHand() {
+    if (!state.room) return;
+    const next = !state.isHandRaised;
+    try {
+      await state.room.localParticipant.setAttributes({
+        handRaised: next ? String(Date.now()) : '',
+      });
+      state.isHandRaised = next;
+      const btn = document.getElementById('btn-raise-hand');
+      if (btn) btn.classList.toggle('active', next);
+      renderParticipants();
+    } catch (e) { console.warn('setAttributes failed:', e); }
   }
 
   // ------------------------------------
