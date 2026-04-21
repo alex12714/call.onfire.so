@@ -586,6 +586,24 @@
           }
         } else if (msg.type === 'poll_new' || msg.type === 'poll_vote_update' || msg.type === 'poll_closed') {
           pollHandleDataPacket(msg);
+        } else if (msg.type === 'breakout_assign') {
+          // Host split us into a breakout room. Server embeds the new token
+          // in the packet so there's no extra round-trip; switch locally.
+          switchRoom({
+            serverUrl: msg.server_url || (state.joinData && state.joinData.server_url),
+            token: msg.token,
+            newRoomName: msg.room_name,
+            reason: 'host_moved_to_breakout',
+          }).catch((e) => console.warn('switchRoom (breakout_assign) failed:', e));
+        } else if (msg.type === 'breakout_ended') {
+          // Timer worker (or host) ended the breakout. Server sends a token
+          // minted for the parent room.
+          switchRoom({
+            serverUrl: msg.server_url || (state.joinData && state.joinData.server_url),
+            token: msg.token,
+            newRoomName: msg.room_name,
+            reason: 'breakout_timer_expired',
+          }).catch((e) => console.warn('switchRoom (breakout_ended) failed:', e));
         }
       } catch (e) {
         // Ignore non-chat data
@@ -986,6 +1004,197 @@
     if (!state.callStartTime) return;
     const elapsed = Math.floor((Date.now() - state.callStartTime) / 1000);
     $('call-timer').textContent = formatDuration(elapsed);
+  }
+
+  // ------------------------------------
+  // Breakouts: Room Switch
+  // ------------------------------------
+  // Re-entrancy guard — two DataPackets arriving in quick succession (e.g.
+  // `breakout_assign` followed by a spurious `breakout_ended`) must not fire
+  // two overlapping disconnect/connect cycles. The first switch wins; later
+  // ones are dropped with a log.
+  let _switchingRoom = false;
+
+  /**
+   * Move the local participant from the current LiveKit room to a new one,
+   * preserving mic/cam state. Used by the breakouts flow: receipt of a
+   * `breakout_assign` or `breakout_ended` DataPacket triggers this.
+   *
+   * On failure within 5s we attempt to reconnect to the ORIGINAL room
+   * (from state.joinData). If that also fails, we fall through to endCall().
+   *
+   * @param {Object} opts
+   * @param {string} opts.serverUrl - New room's LiveKit URL (usually same server).
+   * @param {string} opts.token - Fresh token minted by the server for the new room.
+   * @param {string} opts.newRoomName - Human-readable name for logs / state.
+   * @param {string} [opts.reason] - Diagnostic tag for the logs.
+   */
+  async function switchRoom({ serverUrl, token, newRoomName, reason }) {
+    if (_switchingRoom) {
+      console.warn('switchRoom: already in progress, ignoring (reason=' + reason + ')');
+      return;
+    }
+    if (!serverUrl || !token) {
+      console.warn('switchRoom: missing serverUrl/token, aborting');
+      return;
+    }
+    _switchingRoom = true;
+
+    const LivekitClient = window.LivekitClient;
+    if (!LivekitClient) {
+      console.error('switchRoom: LiveKit SDK missing');
+      _switchingRoom = false;
+      return;
+    }
+
+    // Stash original connection params so we can fall back on failure.
+    const originalServerUrl = (state.joinData && state.joinData.server_url) || null;
+    const originalToken = (state.joinData && state.joinData.token) || null;
+    const originalRoomName = (state.joinData && state.joinData.room_name) || null;
+
+    // Capture mic/cam state BEFORE disconnect. These reads are against the
+    // local participant which is about to be gone. Read once, re-apply later.
+    const prev = state.room && state.room.localParticipant;
+    const wasMicEnabled = prev ? (prev.isMicrophoneEnabled ?? false) : false;
+    const wasCamEnabled = prev ? (prev.isCameraEnabled ?? false) : false;
+    const identity = prev ? prev.identity : null;
+
+    // Notify local listeners before we drop the socket. Best-effort only.
+    try {
+      if (prev) {
+        const bye = utf8Encode(JSON.stringify({
+          type: 'room_switched',
+          from: originalRoomName,
+          to: newRoomName,
+          identity,
+        }));
+        // Synchronous-style publish — we intentionally do not await so the
+        // packet does not widen the disconnect window.
+        prev.publishData(bye, { reliable: false }).catch(() => {});
+      }
+    } catch (_) {
+      /* non-critical */
+    }
+
+    // Disconnect the current room. Mirror the cleanup in endCall but do NOT
+    // tear down the whole UI — we're about to reconnect.
+    if (state.room) {
+      try {
+        // Temporarily pause the RoomEvent.Disconnected → endCall handler by
+        // dropping our reference BEFORE disconnect, so endCall doesn't fire.
+        const oldRoom = state.room;
+        state.room = null;
+        try { await oldRoom.disconnect(); } catch (_) { /* no-op */ }
+      } catch (_) {
+        /* no-op */
+      }
+    }
+    // Detach any lingering remote audio elements from the previous room.
+    document.querySelectorAll('audio[data-onfire-remote-audio]').forEach((el) => el.remove());
+    hideEnableAudioPrompt();
+
+    // Reset chime gate so we don't play a chime per pre-existing participant
+    // in the new breakout. Also clear local raise-hand — participants probably
+    // don't want their hand still raised in the new room (breakout is a clean
+    // start, per design note in ADR 0001).
+    state.hasSeenInitialRoster = false;
+    state.isHandRaised = false;
+    try { updateRaiseHandButton(); } catch (_) { /* UI may not be fully wired during tests */ }
+
+    const connectNewRoom = async () => {
+      const room = new LivekitClient.Room({
+        adaptiveStream: true,
+        dynacast: true,
+        videoCaptureDefaults: {
+          resolution: LivekitClient.VideoPresets.h720.resolution,
+        },
+      });
+      state.room = room;
+      setupRoomEvents(room);
+      // 5s budget for the new connect; anything longer reverts to original.
+      await Promise.race([
+        room.connect(serverUrl, token),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('switchRoom connect timeout')), 5000)
+        ),
+      ]);
+      return room;
+    };
+
+    try {
+      const room = await connectNewRoom();
+
+      // Unblock remote audio while the user-gesture chain is still fresh.
+      try { await room.startAudio(); } catch (_) { /* handled by AudioPlaybackStatusChanged */ }
+      if (!room.canPlaybackAudio) showEnableAudioPrompt(room);
+
+      // Re-apply mic/cam. Wrap each independently — failing to re-enable the
+      // camera in a breakout must not leave the participant disconnected.
+      try {
+        await room.localParticipant.setMicrophoneEnabled(wasMicEnabled);
+        state.isMicMuted = !wasMicEnabled;
+      } catch (e) {
+        console.warn('switchRoom: mic re-enable failed:', e);
+      }
+      try {
+        await room.localParticipant.setCameraEnabled(wasCamEnabled);
+        state.isVideoOff = !wasCamEnabled;
+      } catch (e) {
+        console.warn('switchRoom: camera re-enable failed:', e);
+      }
+      updateControlButtons();
+
+      // Update stored join metadata so subsequent reconnects / refetches
+      // resolve against the room we just moved into.
+      if (state.joinData) {
+        state.joinData.token = token;
+        state.joinData.room_name = newRoomName;
+        state.joinData.server_url = serverUrl;
+      }
+
+      renderParticipants();
+      pollListActive().catch(() => {});
+
+      console.log('switchRoom: moved to "' + newRoomName + '" (reason=' + reason + ')');
+    } catch (err) {
+      console.error('switchRoom: failed to connect to "' + newRoomName + '" (' + reason + '):', err);
+
+      // Fallback: try to reconnect to the original room if we still have creds.
+      if (originalServerUrl && originalToken) {
+        try {
+          const room = new LivekitClient.Room({
+            adaptiveStream: true,
+            dynacast: true,
+            videoCaptureDefaults: {
+              resolution: LivekitClient.VideoPresets.h720.resolution,
+            },
+          });
+          state.room = room;
+          setupRoomEvents(room);
+          await room.connect(originalServerUrl, originalToken);
+          try { await room.startAudio(); } catch (_) {}
+          try { await room.localParticipant.setMicrophoneEnabled(wasMicEnabled); } catch (_) {}
+          try { await room.localParticipant.setCameraEnabled(wasCamEnabled); } catch (_) {}
+          state.isMicMuted = !wasMicEnabled;
+          state.isVideoOff = !wasCamEnabled;
+          updateControlButtons();
+          renderParticipants();
+          console.warn('switchRoom: fell back to original room "' + originalRoomName + '"');
+        } catch (fallbackErr) {
+          console.error('switchRoom: fallback reconnect also failed:', fallbackErr);
+          endCall();
+        }
+      } else {
+        // No original creds to fall back to — drop the call cleanly.
+        endCall();
+      }
+    } finally {
+      _switchingRoom = false;
+    }
+  }
+
+  function utf8Encode(str) {
+    return new TextEncoder().encode(str);
   }
 
   // ------------------------------------
